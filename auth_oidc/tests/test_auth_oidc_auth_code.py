@@ -1,9 +1,11 @@
 # Copyright 2021 ACSONE SA/NV <https://acsone.eu>
 # License: AGPL-3.0 or later (http://www.gnu.org/licenses/agpl)
 
+import base64
 import contextlib
 import hashlib
 import json
+import logging
 import time
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -15,6 +17,7 @@ from jose import jwt
 from jose.utils import long_to_base64
 
 import odoo
+from odoo.exceptions import AccessDenied, ValidationError
 from odoo.tests import common
 
 from odoo.addons.website.tools import MockRequest as _MockRequest
@@ -43,7 +46,11 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             cls.rsa_key_public_pem,
             cls.rsa_key_public_jwk,
         ) = cls._generate_key()
-        _, cls.second_key_public_pem, _ = cls._generate_key()
+        (
+            cls.second_key_pem,
+            cls.second_key_public_pem,
+            cls.second_key_public_jwk,
+        ) = cls._generate_key()
 
     @staticmethod
     def _generate_key():
@@ -190,7 +197,16 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         with MockRequest(self.env) as mock_request:
             response = OpenIDController().signin(state=state)
             self.assertTrue(mock_request.session["auth_oidc_error"])
-        self.assertEqual(response.location, "/odoo")
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("?", response.location)
+
+    def test_non_ascii_state_fails_at_the_fixed_login_destination(self):
+        """Test malformed callback state never raises or remains in the URL."""
+        with MockRequest(self.env) as mock_request:
+            response = OpenIDController().signin(state="not-ascii-€")
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("?", response.location)
 
     def test_claim_without_a_session_database_does_not_open_an_environment(self):
         """Test that callback correlation fails before accessing an environment."""
@@ -231,7 +247,19 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             state, self.env.cr.dbname, "token-test-session"
         )
 
-    def _prepare_login_test_responses(self, attempt, claims=None, access_token="42"):
+    def _prepare_login_test_responses(
+        self,
+        attempt,
+        claims=None,
+        access_token="42",
+        headers=None,
+        signing_key=None,
+        algorithm="RS256",
+        jwks=None,
+        token_status=200,
+        include_access_token=True,
+        include_id_token=True,
+    ):
         """Mock one token/JWKS exchange with a complete signed ID token."""
         now = int(time.time())
         payload = {
@@ -244,16 +272,33 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             "nonce": attempt.nonce,
         }
         payload.update(claims or {})
+        if token_status != 200:
+            responses.add(
+                responses.POST,
+                "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
+                status=token_status,
+            )
+            return
         responses.add(
             responses.POST,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
             json={
-                "access_token": access_token,
-                "id_token": jwt.encode(
-                    payload,
-                    self.rsa_key_pem,
-                    algorithm="RS256",
-                    headers={"kid": "the_key_id"},
+                **({"access_token": access_token} if include_access_token else {}),
+                **(
+                    {
+                        "id_token": jwt.encode(
+                            payload,
+                            signing_key or self.rsa_key_pem,
+                            algorithm=algorithm,
+                            headers=(
+                                headers
+                                if headers is not None
+                                else {"kid": "the_key_id"}
+                            ),
+                        )
+                    }
+                    if include_id_token
+                    else {}
                 ),
             },
         )
@@ -261,7 +306,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         responses.add(
             responses.GET,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/certs",
-            json={"keys": [jwk]},
+            json={"keys": jwks if jwks is not None else [jwk]},
         )
 
     @responses.activate
@@ -277,3 +322,220 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.assertEqual(db, self.env.cr.dbname)
         self.assertEqual(token, "access-sentinel")
         self.assertEqual(login, user.login)
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "consumed")
+
+    @responses.activate
+    def test_strict_claim_failures_mark_the_attempt_failed(self):
+        """Test each claim contract failure denies before native sign-in."""
+        now = int(time.time())
+        self.provider_rec.tenant_id = "tenant-sentinel"
+        failures = {
+            "issuer": {"iss": "wrong-issuer"},
+            "audience": {"aud": "wrong-audience"},
+            "exp": {"exp": None},
+            "nbf": {"nbf": None},
+            "iat": {"iat": None},
+            "nonce": {"nonce": "wrong-nonce"},
+            "missing_tenant": {"tid": None},
+            "tenant": {"tid": "wrong-tenant"},
+            "subject": {"sub": ""},
+            "multi_audience_azp": {"aud": [self.provider_rec.client_id, "other"]},
+            "expired": {"exp": now - 1000},
+            "future_nbf": {"nbf": now + 1000},
+            "future_iat": {"iat": now + 1000},
+        }
+        for name, claims in failures.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, claims=claims)
+                with self.assertRaises(AccessDenied):
+                    self.env["res.users"].auth_oauth(
+                        self.provider_rec.id,
+                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                    )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @staticmethod
+    def _at_hash(access_token):
+        """Return the OpenID Connect RS256 access-token hash for a test token."""
+        digest = hashlib.sha256(access_token.encode()).digest()
+        return (
+            base64.urlsafe_b64encode(digest[: len(digest) // 2]).rstrip(b"=").decode()
+        )
+
+    @responses.activate
+    def test_access_token_hash_is_validated(self):
+        """Test a matching at_hash is accepted and a mismatching hash is terminal."""
+        user = self._prepare_login_test_user()
+        access_token = "access-token-sentinel"
+        valid_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(
+            valid_attempt,
+            access_token=access_token,
+            claims={"at_hash": self._at_hash(access_token)},
+        )
+        _, login, _ = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": valid_attempt.id, "code": "code-sentinel"},
+        )
+        self.assertEqual(login, user.login)
+        responses.reset()
+
+        invalid_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(
+            invalid_attempt,
+            access_token=access_token,
+            claims={"at_hash": "wrong-hash"},
+        )
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": invalid_attempt.id, "code": "code-sentinel"},
+            )
+        invalid_attempt.invalidate_recordset(["status"])
+        self.assertEqual(invalid_attempt.status, "failed")
+
+    @responses.activate
+    def test_missing_token_values_mark_attempt_failed(self):
+        """Test the token response must contain both required token values."""
+        for name, kwargs in {
+            "access_token": {"include_access_token": False},
+            "id_token": {"include_id_token": False},
+        }.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, **kwargs)
+                with self.assertRaises(AccessDenied):
+                    self.env["res.users"].auth_oauth(
+                        self.provider_rec.id,
+                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                    )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @responses.activate
+    def test_key_algorithm_and_signature_failures_mark_attempt_failed(self):
+        """Test key selection, allowlist, and signature failures are terminal."""
+        failures = {
+            "missing_key": {"headers": {"kid": "missing-key"}},
+            "missing_key_id": {"headers": {}},
+            "algorithm": {"algorithm": "HS256", "signing_key": "shared-secret"},
+            "signature": {"signing_key": self.second_key_pem},
+        }
+        for name, kwargs in failures.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, **kwargs)
+                with self.assertRaises(AccessDenied):
+                    self.env["res.users"].auth_oauth(
+                        self.provider_rec.id,
+                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                    )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @responses.activate
+    def test_jwks_rotation_tries_matching_keys_until_signature_validates(self):
+        """Test same-key-ID rotation accepts a later valid JWKS key."""
+        user = self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        old_jwk = dict(self.second_key_public_jwk, kid="the_key_id")
+        current_jwk = dict(self.rsa_key_public_jwk, kid="the_key_id")
+        self._prepare_login_test_responses(attempt, jwks=[old_jwk, current_jwk])
+        _, login, _ = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+        )
+        self.assertEqual(login, user.login)
+
+    def test_wrong_attempt_provider_is_rejected_before_exchange(self):
+        """Test a claimed attempt cannot be used with a different provider."""
+        attempt = self._claimed_attempt()
+        other_provider = self.env["auth.oauth.provider"].create(
+            {
+                "name": "Other OpenID Connect Provider",
+                "flow": "id_token_code",
+                "enabled": False,
+                "client_id": "other-client",
+            }
+        )
+        attempt.write({"provider_id": other_provider.id})
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": attempt.id + 1000000,
+                    "code": "code-sentinel",
+                },
+            )
+
+    def test_provider_configuration_and_clock_skew_are_constrained(self):
+        """Test enabled OIDC configuration and clock skew fail at the ORM boundary."""
+        with self.assertRaises(ValidationError):
+            self.provider_rec.write({"clock_skew_seconds": 301})
+        with self.assertRaises(ValidationError):
+            self.provider_rec.write({"allowed_algorithms": "HS256"})
+        with self.assertRaises(ValidationError):
+            self.env["auth.oauth.provider"].create(
+                {
+                    "name": "Incomplete OpenID Connect Provider",
+                    "flow": "id_token_code",
+                    "enabled": True,
+                }
+            )
+
+    def test_expected_failure_log_redacts_callback_sentinels(self):
+        """Test typed protocol failures do not log callback or provider text."""
+        attempt = self._claimed_attempt()
+        with (
+            self.assertRaises(AccessDenied),
+            self.assertLogs(
+                "odoo.addons.auth_oidc.models.res_users", level=logging.INFO
+            ) as logs,
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": attempt.id,
+                    "error": "error-sentinel",
+                    "code": "code-sentinel",
+                },
+            )
+        output = "\n".join(logs.output)
+        for sentinel in ("error-sentinel", "code-sentinel", attempt.nonce):
+            self.assertNotIn(sentinel, output)
+
+    @responses.activate
+    def test_provider_denial_and_exchange_failure_mark_attempt_failed(self):
+        """Test provider and token-endpoint errors are terminal and redacted."""
+        denied_attempt = self._claimed_attempt()
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": denied_attempt.id,
+                    "error": "provider-error-sentinel",
+                },
+            )
+        denied_attempt.invalidate_recordset(["status"])
+        self.assertEqual(denied_attempt.status, "failed")
+
+        exchange_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(exchange_attempt, token_status=500)
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": exchange_attempt.id, "code": "code-sentinel"},
+            )
+        exchange_attempt.invalidate_recordset(["status"])
+        self.assertEqual(exchange_attempt.status, "failed")

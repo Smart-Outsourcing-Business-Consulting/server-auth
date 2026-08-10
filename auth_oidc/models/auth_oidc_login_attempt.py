@@ -115,7 +115,10 @@ class AuthOIDCLoginAttempt(models.Model):
         """Atomically claim an unexpired attempt bound to this browser session."""
         if not state or not isinstance(state, str):
             return self.browse()
-        digest = self._state_digest(state)
+        try:
+            digest = self._state_digest(state)
+        except UnicodeEncodeError:
+            return self.browse()
         candidate = self.sudo().search([("state_digest", "=", digest)], limit=1)
         if not candidate:
             return candidate
