@@ -25,6 +25,7 @@ from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.website.tools import MockRequest as _MockRequest
 
 from ..controllers.main import OpenIDController, OpenIDLogin
+from ..models.auth_oauth_provider import OIDCAuthenticationError
 from ..models.res_users import OIDCFailure, ResUsers, VerifiedOIDCLoginContext
 
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
@@ -403,6 +404,96 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.assertEqual(login, user.login)
         attempt.invalidate_recordset(["status"])
         self.assertEqual(attempt.status, "consumed")
+
+    @responses.activate
+    def test_finalizer_receives_exact_user_before_attempt_consumption(self):
+        """Test the downstream finalizer receives the verified principal once."""
+        user = self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(attempt)
+
+        def finalizer(_users, provider, principal, login_context, final_user):
+            attempt.invalidate_recordset(["status"])
+            self.assertEqual(attempt.status, "claimed")
+            self.assertEqual(provider, self.provider_rec)
+            self.assertEqual(principal.subject, "test-subject")
+            self.assertEqual(login_context.attempt_id, attempt.id)
+            self.assertEqual(final_user, user)
+
+        with patch.object(
+            ResUsers,
+            "_auth_oidc_finalize_user_provisioning",
+            autospec=True,
+            side_effect=finalizer,
+        ) as finalizer_hook:
+            _database, login, _token = self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+
+        self.assertEqual(login, user.login)
+        finalizer_hook.assert_called_once()
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "consumed")
+
+    @responses.activate
+    def test_finalizer_failure_rolls_back_native_signin_and_callback(self):
+        """Test a finalizer failure rolls back credential writes and reaches login."""
+        user = self._prepare_login_test_user()
+        user.oauth_access_token = "previous-token"
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt, access_token="new-token")
+
+        with (
+            MockRequest(self.env) as mock_request,
+            patch.object(
+                ResUsers,
+                "_auth_oidc_finalize_user_provisioning",
+                autospec=True,
+                side_effect=OIDCAuthenticationError("finalizer_failed"),
+            ),
+        ):
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+
+        user.invalidate_recordset(["oauth_access_token"])
+        self.assertEqual(user.oauth_access_token, "previous-token")
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+
+    @responses.activate
+    def test_finalizer_requires_matching_exact_identity_login(self):
+        """Test a callback cannot finalize a different user login."""
+        self._prepare_login_test_user()
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt)
+
+        with (
+            MockRequest(self.env) as mock_request,
+            patch.object(
+                ResUsers,
+                "_auth_oidc_signin",
+                autospec=True,
+                return_value="different-login",
+            ),
+            patch.object(
+                ResUsers, "_auth_oidc_finalize_user_provisioning", autospec=True
+            ) as finalizer_hook,
+        ):
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+
+        finalizer_hook.assert_not_called()
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
 
     def test_claimed_provider_denial_is_normalized_after_native_handling(self):
         """Test provider denial reaches native OAuth then returns fixed login."""
