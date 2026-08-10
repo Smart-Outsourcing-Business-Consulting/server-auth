@@ -4,12 +4,10 @@
 
 {
     "name": "Authentication OpenID Connect",
-    "version": "18.0.1.2.0",
+    "version": "18.0.1.3.0",
     "license": "AGPL-3",
     "author": (
-        "ICTSTUDIO, André Schenkels, "
-        "ACSONE SA/NV, "
-        "Odoo Community Association (OCA)"
+        "ICTSTUDIO, André Schenkels, ACSONE SA/NV, Odoo Community Association (OCA)"
     ),
     "maintainers": ["sbidoul"],
     "website": "https://github.com/OCA/server-auth",

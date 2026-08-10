@@ -1,19 +1,22 @@
 ## Setup for Microsoft Azure
 
-Example configuration with OpenID Connect authorization code flow.
+Example configuration with the required OpenID Connect authorization-code
+flow.
 
 1. configure a new web application in Azure with OpenID and code flow (see
 the [provider
 documentation](https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-provider)))
 
-2. in this application the redirect url must be be "\<url of your
-server\>/auth_oauth/signin" and of course this URL should be reachable
-from Azure
+2. Register the exact callback URI for every supported Odoo host:
+   `https://<server>/auth_oauth/signin`. Wildcards are not supported. The
+   callback URI used for a login is derived from the proxy-adjusted Odoo
+   request origin, so verify proxy configuration and every registered branch
+   host before deployment.
 
-3. create a new authentication provider in Odoo with the following
-parameters (see the [portal
-documentation](https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-settings)
-for more information):
+3. Create a new authentication provider in Odoo with the authorization-code
+   flow, `openid` scope, exact issuer, token URL, JWKS URL, and an asymmetric
+   allowed algorithm (RS256 for Microsoft Entra). Set the Entra tenant ID when
+   the provider is tenant-restricted.
 
 ![image](../static/description/oauth-microsoft_azure-api_permissions.png)
 
@@ -40,7 +43,8 @@ or
 
 ## Setup for Keycloak
 
-Example configuration with OpenID Connect authorization code flow.
+Example configuration with the required OpenID Connect authorization-code
+flow.
 
 In Keycloak:
 
@@ -49,8 +53,8 @@ In Keycloak:
 Enabled.
 3. configure the client Access Type as "confidential" and take
 note of the client secret in the Credentials tab
-4. configure the
-redirect url to be "\<url of your server\>/auth_oauth/signin"
+4. register the exact redirect URL
+`https://<server>/auth_oauth/signin` for every supported Odoo host
 
 In Odoo, create a new Oauth Provider with the following parameters:
 
@@ -70,3 +74,5 @@ In Odoo, create a new Oauth Provider with the following parameters:
   Configuration of your Keycloak realm
 - JWKS URL: The "jwks_uri" URL found in the OpenID Endpoint
   Configuration of your Keycloak realm
+- Issuer: the exact issuer from the OpenID Endpoint Configuration
+- Allowed Algorithms: the asymmetric signing algorithm used by the realm

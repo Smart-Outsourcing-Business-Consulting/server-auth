@@ -1,7 +1,3 @@
-.. image:: https://odoo-community.org/readme-banner-image
-   :target: https://odoo-community.org/get-involved?utm_source=readme
-   :alt: Odoo Community Association
-
 =============================
 Authentication OpenID Connect
 =============================
@@ -17,7 +13,7 @@ Authentication OpenID Connect
 .. |badge1| image:: https://img.shields.io/badge/maturity-Beta-yellow.png
     :target: https://odoo-community.org/page/development-status
     :alt: Beta
-.. |badge2| image:: https://img.shields.io/badge/license-AGPL--3-blue.png
+.. |badge2| image:: https://img.shields.io/badge/licence-AGPL--3-blue.png
     :target: http://www.gnu.org/licenses/agpl-3.0-standalone.html
     :alt: License: AGPL-3
 .. |badge3| image:: https://img.shields.io/badge/github-OCA%2Fserver--auth-lightgray.png?logo=github
@@ -32,11 +28,14 @@ Authentication OpenID Connect
 
 |badge1| |badge2| |badge3| |badge4| |badge5|
 
-This module allows users to login through an OpenID Connect provider
-using the authorization code flow or implicit flow.
+This module adds a strict OpenID Connect authorization-code adapter to
+Odoo. Each login uses server-side state, nonce, and PKCE material; the
+adapter then validates the token signature and required claims before it
+hands an immutable principal to Odoo's native OAuth sign-in flow.
 
-Note the implicit flow is not recommended because it exposes access
-tokens to the browser and in http logs.
+Implicit and hybrid browser-token flows are not supported. This addon
+does not choose user types, groups, companies, or employee records; a
+downstream policy addon owns those decisions.
 
 **Table of contents**
 
@@ -56,48 +55,56 @@ Configuration
 Setup for Microsoft Azure
 -------------------------
 
-Example configuration with OpenID Connect authorization code flow.
+Example configuration with the required OpenID Connect
+authorization-code flow.
 
 1. configure a new web application in Azure with OpenID and code flow
    (see the `provider
    documentation <https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-provider>`__))
 
-2. in this application the redirect url must be be "<url of your
-   server>/auth_oauth/signin" and of course this URL should be reachable
-   from Azure
+2. Register the exact callback URI for every supported Odoo host:
+   ``https://<server>/auth_oauth/signin``. Wildcards are not supported.
+   The callback URI used for a login is derived from the proxy-adjusted
+   Odoo request origin, so verify proxy configuration and every
+   registered branch host before deployment.
 
-3. create a new authentication provider in Odoo with the following
-   parameters (see the `portal
-   documentation <https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-settings>`__
-   for more information):
+3. Create a new authentication provider in Odoo with the
+   authorization-code flow, ``openid`` scope, exact issuer, token URL,
+   JWKS URL, and an asymmetric allowed algorithm (RS256 for Microsoft
+   Entra). Set the Entra tenant ID when the provider is
+   tenant-restricted.
 
-|image|
+.. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-api_permissions.png
+   :alt: image
 
-|image1|
+.. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-optional_claims.png
+   :alt: image
 
 Single tenant provider limits the access to user of your tenant, while
 Multitenants allow access for all AzureAD users, so user of foreign
 companies can use their AzureAD login without an guest account.
 
-- Provider Name: Azure AD Single Tenant
-- Client ID: Application (client) id
-- Client Secret: Client secret
-- Allowed: yes
+-  Provider Name: Azure AD Single Tenant
+-  Client ID: Application (client) id
+-  Client Secret: Client secret
+-  Allowed: yes
 
 or
 
-- Provider Name: Azure AD Multitenant
-- Client ID: Application (client) id
-- Client Secret: Client secret
-- Allowed: yes
-- replace {tenant_id} in urls with your Azure tenant id
+-  Provider Name: Azure AD Multitenant
+-  Client ID: Application (client) id
+-  Client Secret: Client secret
+-  Allowed: yes
+-  replace {tenant_id} in urls with your Azure tenant id
 
-|image2|
+.. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/odoo-azure_ad_multitenant.png
+   :alt: image
 
 Setup for Keycloak
 ------------------
 
-Example configuration with OpenID Connect authorization code flow.
+Example configuration with the required OpenID Connect
+authorization-code flow.
 
 In Keycloak:
 
@@ -105,97 +112,103 @@ In Keycloak:
 2. make sure Authorization Code Flow is Enabled.
 3. configure the client Access Type as "confidential" and take note of
    the client secret in the Credentials tab
-4. configure the redirect url to be "<url of your
-   server>/auth_oauth/signin"
+4. register the exact redirect URL
+   ``https://<server>/auth_oauth/signin`` for every supported Odoo host
 
 In Odoo, create a new Oauth Provider with the following parameters:
 
-- Provider name: Keycloak (or any name you like that identify your
-  keycloak provider)
-- Auth Flow: OpenID Connect (authorization code flow)
-- Client ID: the same Client ID you entered when configuring the client
-  in Keycloak
-- Client Secret: found in keycloak on the client Credentials tab
-- Allowed: yes
-- Body: the link text to appear on the login page, such as Login with
-  Keycloak
-- Scope: openid email
-- Authentication URL: The "authorization_endpoint" URL found in the
-  OpenID Endpoint Configuration of your Keycloak realm
-- Token URL: The "token_endpoint" URL found in the OpenID Endpoint
-  Configuration of your Keycloak realm
-- JWKS URL: The "jwks_uri" URL found in the OpenID Endpoint
-  Configuration of your Keycloak realm
-
-.. |image| image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-api_permissions.png
-.. |image1| image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-optional_claims.png
-.. |image2| image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/odoo-azure_ad_multitenant.png
+-  Provider name: Keycloak (or any name you like that identify your
+   keycloak provider)
+-  Auth Flow: OpenID Connect (authorization code flow)
+-  Client ID: the same Client ID you entered when configuring the client
+   in Keycloak
+-  Client Secret: found in keycloak on the client Credentials tab
+-  Allowed: yes
+-  Body: the link text to appear on the login page, such as Login with
+   Keycloak
+-  Scope: openid email
+-  Authentication URL: The "authorization_endpoint" URL found in the
+   OpenID Endpoint Configuration of your Keycloak realm
+-  Token URL: The "token_endpoint" URL found in the OpenID Endpoint
+   Configuration of your Keycloak realm
+-  JWKS URL: The "jwks_uri" URL found in the OpenID Endpoint
+   Configuration of your Keycloak realm
+-  Issuer: the exact issuer from the OpenID Endpoint Configuration
+-  Allowed Algorithms: the asymmetric signing algorithm used by the
+   realm
 
 Usage
 =====
 
-On the login page, click on the authentication provider you configured.
+On the login page, click the authentication provider you configured. The
+provider must use the authorization-code flow. Odoo completes account
+lookup, authentication, session rotation, and the final local redirect
+only after this addon verifies the OIDC response.
 
 Known issues / Roadmap
 ======================
 
-- When going to the login screen, check for a existing token and do a
-  direct login without the clicking on the SSO link
-- When doing a logout an extra option to also logout at the SSO
-  provider.
+Provider-initiated logout and long-lived token management are outside
+this addon's authorization-code login scope.
 
 Changelog
 =========
 
+18.0.1.3.0 2026-08-10
+---------------------
+
+-  Harden authorization-code login and remove implicit-flow
+   documentation and test configuration.
+
 18.0.1.0.0 2024-10-09
 ---------------------
 
-- Odoo 18 migration
+-  Odoo 18 migration
 
 17.0.1.0.0 2024-03-20
 ---------------------
 
-- Odoo 17 migration
+-  Odoo 17 migration
 
 16.0.1.1.0 2024-02-28
 ---------------------
 
-- Forward port OpenID Connect fixes from 15.0 to 16.0
+-  Forward port OpenID Connect fixes from 15.0 to 16.0
 
 16.0.1.0.2 2023-11-16
 ---------------------
 
-- Readme link updates
+-  Readme link updates
 
 16.0.1.0.1 2023-10-09
 ---------------------
 
-- Add AzureAD code flow provider
+-  Add AzureAD code flow provider
 
 16.0.1.0.0 2023-01-27
 ---------------------
 
-- Odoo 16 migration
+-  Odoo 16 migration
 
 15.0.1.0.0 2023-01-06
 ---------------------
 
-- Odoo 15 migration
+-  Odoo 15 migration
 
 14.0.1.0.0 2021-12-10
 ---------------------
 
-- Odoo 14 migration
+-  Odoo 14 migration
 
 13.0.1.0.0 2020-04-10
 ---------------------
 
-- Odoo 13 migration, add authorization code flow.
+-  Odoo 13 migration, add authorization code flow.
 
 10.0.1.0.0 2018-10-05
 ---------------------
 
-- Initial implementation
+-  Initial implementation
 
 Bug Tracker
 ===========
@@ -220,10 +233,10 @@ Authors
 Contributors
 ------------
 
-- Alexandre Fayolle <alexandre.fayolle@camptocamp.com>
-- Stéphane Bidoul <stephane.bidoul@acsone.eu>
-- David Jaen <david.jaen.revert@gmail.com>
-- Andreas Perhab <andreas.perhab@wt-io-it.at>
+-  Alexandre Fayolle <alexandre.fayolle@camptocamp.com>
+-  Stéphane Bidoul <stephane.bidoul@acsone.eu>
+-  David Jaen <david.jaen.revert@gmail.com>
+-  Andreas Perhab <andreas.perhab@wt-io-it.at>
 
 Maintainers
 -----------
