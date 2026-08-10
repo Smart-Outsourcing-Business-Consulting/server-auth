@@ -24,11 +24,6 @@ msgid "Client Secret"
 msgstr ""
 
 #. module: auth_oidc
-#: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__code_verifier
-msgid "Code Verifier"
-msgstr ""
-
-#. module: auth_oidc
 #: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__end_session_endpoint
 msgid "End Session URL"
 msgstr ""
@@ -60,11 +55,6 @@ msgid "OpenID Connect (authorization code flow)"
 msgstr ""
 
 #. module: auth_oidc
-#: model:ir.model.fields.selection,name:auth_oidc.selection__auth_oauth_provider__flow__id_token
-msgid "OpenID Connect (implicit flow, not recommended)"
-msgstr ""
-
-#. module: auth_oidc
 #: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__token_endpoint
 msgid "Required for OpenID Connect authorization code flow."
 msgstr ""
@@ -75,26 +65,8 @@ msgid "Required for OpenID Connect."
 msgstr ""
 
 #. module: auth_oidc
-#: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__token_map
-msgid ""
-"Some Oauth providers don't map keys in their responses exactly as required."
-"  It is important to ensure user_id and email at least are mapped. For "
-"OpenID Connect user_id is the sub key in the standard."
-msgstr ""
-
-#. module: auth_oidc
-#: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__token_map
-msgid "Token Map"
-msgstr ""
-
-#. module: auth_oidc
 #: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__token_endpoint
 msgid "Token URL"
-msgstr ""
-
-#. module: auth_oidc
-#: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__code_verifier
-msgid "Used for PKCE."
 msgstr ""
 
 #. module: auth_oidc

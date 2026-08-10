@@ -1,3 +1,8 @@
+## 18.0.1.3.0 2026-08-10
+
+- Harden authorization-code login and remove implicit-flow documentation and
+  test configuration.
+
 ## 18.0.1.0.0 2024-10-09
 
 - Odoo 18 migration
