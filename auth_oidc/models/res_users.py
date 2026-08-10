@@ -54,6 +54,22 @@ class VerifiedOIDCPrincipal:
         )
 
 
+@dataclass(frozen=True)
+class VerifiedOIDCLoginContext:
+    """Non-secret correlation context for downstream OIDC login policy."""
+
+    attempt_id: int
+    website_id: int | None
+
+    @classmethod
+    def from_attempt(cls, attempt):
+        """Build the narrow immutable context from one verified attempt."""
+        return cls(
+            attempt_id=int(attempt.id),
+            website_id=int(attempt.website_id) if attempt.website_id else None,
+        )
+
+
 class ResUsers(models.Model):
     """Authenticate OIDC only after its matching attempt is fully validated."""
 
@@ -86,7 +102,10 @@ class ResUsers(models.Model):
                 "access_token": access_token,
                 "state": json.dumps(attempt.native_state),
             }
-            login = self._auth_oidc_signin(oauth_provider.id, principal, native_params)
+            login_context = VerifiedOIDCLoginContext.from_attempt(attempt)
+            login = self._auth_oidc_signin(
+                oauth_provider.id, principal, login_context, native_params
+            )
             if not login:
                 raise OIDCAuthenticationError("native_signin_denied")
             attempt.mark_consumed()
@@ -126,8 +145,9 @@ class ResUsers(models.Model):
         return attempt
 
     @api.model
-    def _auth_oidc_signin(self, provider, principal, native_params):
+    def _auth_oidc_signin(self, provider, principal, login_context, native_params):
         """Delegate a verified immutable principal to native OAuth user lookup."""
+        del login_context
         validation = {"user_id": principal.subject}
         for name in ("email", "name"):
             if isinstance(principal.claims.get(name), str):

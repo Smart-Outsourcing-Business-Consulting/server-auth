@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -24,6 +25,7 @@ from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.website.tools import MockRequest as _MockRequest
 
 from ..controllers.main import OpenIDController, OpenIDLogin
+from ..models.res_users import ResUsers, VerifiedOIDCLoginContext
 
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
 
@@ -266,6 +268,58 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             False,
             BASE_URL + "/auth_oauth/signin",
         )
+
+    def test_login_context_is_immutable_and_contains_only_safe_identifiers(self):
+        """Test the downstream context excludes every attempt secret and record."""
+        attempt, _state = self._pending_callback_attempt()
+        attempt.website_id = 42
+        login_context = VerifiedOIDCLoginContext.from_attempt(attempt)
+        self.assertEqual(login_context.attempt_id, attempt.id)
+        self.assertEqual(login_context.website_id, 42)
+        self.assertEqual(
+            set(login_context.__dataclass_fields__), {"attempt_id", "website_id"}
+        )
+        for forbidden in (
+            "attempt",
+            "database_name",
+            "session_fingerprint",
+            "redirect_path",
+            "callback_uri",
+            "nonce",
+            "code_verifier",
+            "access_token",
+            "claims",
+        ):
+            self.assertFalse(hasattr(login_context, forbidden))
+        with self.assertRaises(FrozenInstanceError):
+            login_context.website_id = 7
+
+    def test_login_context_normalizes_missing_website_to_none(self):
+        """Test a missing initiating website has one explicit representation."""
+        attempt, _state = self._pending_callback_attempt()
+        self.assertIsNone(VerifiedOIDCLoginContext.from_attempt(attempt).website_id)
+
+    @responses.activate
+    def test_policy_hook_receives_login_context_and_sanitized_native_params(self):
+        """Test the four-argument hook receives only explicit trusted values."""
+        user = self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        attempt.website_id = 42
+        self._prepare_login_test_responses(attempt)
+        with patch.object(
+            ResUsers, "_auth_oidc_signin", autospec=True, return_value=user.login
+        ) as signin_hook:
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        _users, provider, _principal, login_context, native_params = (
+            signin_hook.call_args.args
+        )
+        self.assertEqual(provider, self.provider_rec.id)
+        self.assertEqual(login_context, VerifiedOIDCLoginContext(attempt.id, 42))
+        self.assertEqual(set(native_params), {"access_token", "state"})
+        self.assertNotIn("code-sentinel", native_params.values())
 
     def _prepare_login_test_responses(
         self,
