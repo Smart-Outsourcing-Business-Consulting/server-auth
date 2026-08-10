@@ -63,8 +63,10 @@ class ResUsers(models.Model):
     def auth_oauth(self, provider, params):
         """Keep native OAuth untouched and route OIDC through the strict boundary."""
         oauth_provider = self.env["auth.oauth.provider"].browse(provider).exists()
-        if not oauth_provider or oauth_provider.flow != "id_token_code":
+        if oauth_provider and oauth_provider.flow == "access_token":
             return super().auth_oauth(provider, params)
+        if not oauth_provider or oauth_provider.flow != "id_token_code":
+            raise AccessDenied()
         attempt = self._claimed_oidc_attempt(
             oauth_provider, params.get("_auth_oidc_attempt_id")
         )

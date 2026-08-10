@@ -208,6 +208,13 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.assertEqual(response.location, "/web/login")
         self.assertNotIn("?", response.location)
 
+    def test_native_failure_redirect_detection_preserves_success_locations(self):
+        """Test native error redirects alone are normalized after callback claim."""
+        failure = type("Response", (), {"location": "/web/login?oauth_error=3"})()
+        success = type("Response", (), {"location": "/odoo"})()
+        self.assertTrue(OpenIDController._is_native_failure_redirect(failure))
+        self.assertFalse(OpenIDController._is_native_failure_redirect(success))
+
     def test_claim_without_a_session_database_does_not_open_an_environment(self):
         """Test that callback correlation fails before accessing an environment."""
 
@@ -478,6 +485,18 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                     "code": "code-sentinel",
                 },
             )
+
+    def test_legacy_or_unknown_provider_never_falls_back_to_native_validation(self):
+        """Test injected legacy and unknown flows deny before native OAuth."""
+        self.env.cr.execute(
+            "UPDATE auth_oauth_provider SET flow = 'id_token' WHERE id = %s",
+            [self.provider_rec.id],
+        )
+        self.provider_rec.invalidate_recordset(["flow"])
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(self.provider_rec.id, {})
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(self.provider_rec.id + 1000000, {})
 
     def test_provider_configuration_and_clock_skew_are_constrained(self):
         """Test enabled OIDC configuration and clock skew fail at the ORM boundary."""
