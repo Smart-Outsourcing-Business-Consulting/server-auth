@@ -174,8 +174,14 @@ class AuthOauthProvider(models.Model):
                 auth=auth,
                 timeout=10,
             )
-            response.raise_for_status()
             payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError
+            if payload.get("error") == "invalid_client":
+                raise OIDCAuthenticationError("credential_rejected")
+            response.raise_for_status()
+        except OIDCAuthenticationError:
+            raise
         except (requests.RequestException, ValueError, TypeError):
             raise OIDCAuthenticationError("token_exchange_failed") from None
         access_token = payload.get("access_token")

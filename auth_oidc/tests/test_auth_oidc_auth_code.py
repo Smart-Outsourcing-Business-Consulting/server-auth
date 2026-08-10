@@ -25,7 +25,7 @@ from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.website.tools import MockRequest as _MockRequest
 
 from ..controllers.main import OpenIDController, OpenIDLogin
-from ..models.res_users import ResUsers, VerifiedOIDCLoginContext
+from ..models.res_users import OIDCFailure, ResUsers, VerifiedOIDCLoginContext
 
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
 
@@ -647,6 +647,96 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         output = "\n".join(logs.output)
         for sentinel in ("error-sentinel", "code-sentinel", attempt.nonce):
             self.assertNotIn(sentinel, output)
+
+    def test_failure_notification_is_frozen_and_contains_no_secret_fields(self):
+        """Test the notification shape contains only reason and attempt correlation."""
+        failure = OIDCFailure(reason="credential_rejected", attempt_id=42)
+        self.assertEqual(set(failure.__dataclass_fields__), {"reason", "attempt_id"})
+        for forbidden in (
+            "message",
+            "description",
+            "response",
+            "body",
+            "code",
+            "token",
+            "nonce",
+            "claims",
+        ):
+            self.assertFalse(hasattr(failure, forbidden))
+        with self.assertRaises(FrozenInstanceError):
+            failure.reason = "changed"
+
+    @responses.activate
+    def test_invalid_client_is_classified_and_notifies_once(self):
+        """Test exact token JSON invalid_client becomes one credential notification."""
+        attempt = self._claimed_attempt()
+        responses.add(
+            responses.POST,
+            self.provider_rec.token_endpoint,
+            status=401,
+            json={
+                "error": "invalid_client",
+                "error_description": "secret-description-sentinel",
+            },
+        )
+        with (
+            patch.object(ResUsers, "_auth_oidc_failure", autospec=True) as failure_hook,
+            self.assertRaises(AccessDenied),
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        failure_hook.assert_called_once()
+        _users, provider, failure = failure_hook.call_args.args
+        self.assertEqual(provider, self.provider_rec.id)
+        self.assertEqual(failure, OIDCFailure("credential_rejected", attempt.id))
+
+    @responses.activate
+    def test_other_token_error_keeps_generic_exchange_classification(self):
+        """Test provider errors other than exact invalid_client stay generic."""
+        attempt = self._claimed_attempt()
+        responses.add(
+            responses.POST,
+            self.provider_rec.token_endpoint,
+            status=400,
+            json={"error": "invalid_grant", "error_description": "secret-sentinel"},
+        )
+        with (
+            patch.object(ResUsers, "_auth_oidc_failure", autospec=True) as failure_hook,
+            self.assertRaises(AccessDenied),
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        failure = failure_hook.call_args.args[-1]
+        self.assertEqual(failure.reason, "token_exchange_failed")
+
+    @responses.activate
+    def test_failure_hook_exception_preserves_access_denied(self):
+        """Test an extension-hook exception cannot replace generic auth failure."""
+        attempt = self._claimed_attempt()
+        with (
+            patch.object(
+                ResUsers,
+                "_auth_oidc_failure",
+                autospec=True,
+                side_effect=RuntimeError("hook-secret-sentinel"),
+            ),
+            self.assertRaises(AccessDenied),
+            self.assertLogs(
+                "odoo.addons.auth_oidc.models.res_users", level=logging.ERROR
+            ) as logs,
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": attempt.id,
+                    "error": "provider-error-sentinel",
+                },
+            )
+        self.assertNotIn("hook-secret-sentinel", "\n".join(logs.output))
 
     @responses.activate
     def test_provider_denial_and_exchange_failure_mark_attempt_failed(self):
