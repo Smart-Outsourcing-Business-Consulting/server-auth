@@ -20,6 +20,7 @@ import odoo
 from odoo.exceptions import AccessDenied, ValidationError
 from odoo.tests import common
 
+from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.website.tools import MockRequest as _MockRequest
 
 from ..controllers.main import OpenIDController, OpenIDLogin
@@ -254,6 +255,18 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             state, self.env.cr.dbname, "token-test-session"
         )
 
+    def _pending_callback_attempt(self):
+        """Create one pending attempt bound to the MockRequest browser session."""
+        return self.env["auth.oidc.login.attempt"].create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "auth-oidc-test-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
+            "/odoo",
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+
     def _prepare_login_test_responses(
         self,
         attempt,
@@ -331,6 +344,53 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.assertEqual(login, user.login)
         attempt.invalidate_recordset(["status"])
         self.assertEqual(attempt.status, "consumed")
+
+    def test_claimed_provider_denial_is_normalized_after_native_handling(self):
+        """Test provider denial reaches native OAuth then returns fixed login."""
+        attempt, state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            response = OpenIDController().signin(
+                state=state, error="provider-error-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("provider-error-sentinel", response.location)
+        self.assertNotIn("oauth_error", response.location)
+
+    @responses.activate
+    def test_claimed_exchange_failure_is_normalized_after_native_handling(self):
+        """Test token exchange failure reaches native OAuth then uses fixed login."""
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt, token_status=500)
+        with MockRequest(self.env) as mock_request:
+            response = OpenIDController().signin(state=state, code="code-sentinel")
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("code-sentinel", response.location)
+
+    def test_native_callback_failure_is_rewritten_and_success_is_preserved(self):
+        """Test only a native OAuth error redirect is replaced after attempt claim."""
+        failing_attempt, failing_state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            native_failure = mock_request.redirect("/web/login?oauth_error=2", 303)
+            with patch.object(OAuthController, "signin", return_value=native_failure):
+                response = OpenIDController().signin(state=failing_state)
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.location, "/web/login")
+
+        success_attempt, success_state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            native_success = mock_request.redirect("/odoo", 303)
+            with patch.object(OAuthController, "signin", return_value=native_success):
+                response = OpenIDController().signin(state=success_state)
+            self.assertNotIn("auth_oidc_error", mock_request.session)
+        self.assertEqual(response.location, "/odoo")
 
     @responses.activate
     def test_strict_claim_failures_mark_the_attempt_failed(self):
