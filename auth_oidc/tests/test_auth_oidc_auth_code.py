@@ -88,6 +88,19 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         )
         self.assertEqual(len(self.provider_rec), 1)
 
+    def _auth_oauth_denied(self, provider_id, params):
+        """Run one terminal OIDC failure without the test rollback savepoint."""
+        try:
+            self.env["res.users"].auth_oauth(provider_id, params)
+        except AccessDenied:
+            return
+        self.fail("AccessDenied not raised")
+
+    @staticmethod
+    def _signin_controller_boundary(**params):
+        """Call the controller endpoint without the unrouted HTTP wrapper."""
+        return OpenIDController.signin.original_endpoint(OpenIDController(), **params)
+
     def test_auth_link(self):
         """Test that the authentication link is correct."""
         # disable existing providers except our test provider
@@ -171,7 +184,11 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         for redirect in unsafe_redirects:
             with MockRequest(self.env) as mock_request:
                 mock_request.params = {"redirect": redirect}
-                auth_link = OpenIDLogin().list_providers()[0]["auth_link"]
+                auth_link = next(
+                    provider["auth_link"]
+                    for provider in OpenIDLogin().list_providers()
+                    if provider["id"] == self.provider_rec.id
+                )
             state = parse_qs(urlparse(auth_link).query)["state"][0]
             attempt = self.env["auth.oidc.login.attempt"].search(
                 [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
@@ -212,7 +229,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         """Test that a native-shaped callback state cannot bypass OIDC correlation."""
         state = json.dumps({"d": self.env.cr.dbname, "p": self.provider_rec.id})
         with MockRequest(self.env) as mock_request:
-            response = OpenIDController().signin(state=state)
+            response = self._signin_controller_boundary(state=state)
             self.assertTrue(mock_request.session["auth_oidc_error"])
         self.assertEqual(response.location, "/web/login")
         self.assertNotIn("?", response.location)
@@ -220,7 +237,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
     def test_non_ascii_state_fails_at_the_fixed_login_destination(self):
         """Test malformed callback state never raises or remains in the URL."""
         with MockRequest(self.env) as mock_request:
-            response = OpenIDController().signin(state="not-ascii-€")
+            response = self._signin_controller_boundary(state="not-ascii-€")
             self.assertTrue(mock_request.session["auth_oidc_error"])
         self.assertEqual(response.location, "/web/login")
         self.assertNotIn("?", response.location)
@@ -417,7 +434,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         """Test provider denial reaches native OAuth then returns fixed login."""
         attempt, state = self._pending_callback_attempt()
         with MockRequest(self.env) as mock_request:
-            response = OpenIDController().signin(
+            response = self._signin_controller_boundary(
                 state=state, error="provider-error-sentinel"
             )
             self.assertTrue(mock_request.session["auth_oidc_error"])
@@ -434,7 +451,9 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         attempt, state = self._pending_callback_attempt()
         self._prepare_login_test_responses(attempt, token_status=500)
         with MockRequest(self.env) as mock_request:
-            response = OpenIDController().signin(state=state, code="code-sentinel")
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
             self.assertTrue(mock_request.session["auth_oidc_error"])
         attempt.invalidate_recordset(["status"])
         self.assertEqual(attempt.status, "failed")
@@ -448,7 +467,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         with MockRequest(self.env) as mock_request:
             native_failure = mock_request.redirect("/web/login?oauth_error=2", 303)
             with patch.object(OAuthController, "signin", return_value=native_failure):
-                response = OpenIDController().signin(state=failing_state)
+                response = self._signin_controller_boundary(state=failing_state)
             self.assertTrue(mock_request.session["auth_oidc_error"])
         self.assertEqual(response.location, "/web/login")
 
@@ -456,7 +475,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         with MockRequest(self.env) as mock_request:
             native_success = mock_request.redirect("/odoo", 303)
             with patch.object(OAuthController, "signin", return_value=native_success):
-                response = OpenIDController().signin(state=success_state)
+                response = self._signin_controller_boundary(state=success_state)
             self.assertNotIn("auth_oidc_error", mock_request.session)
         self.assertEqual(response.location, "/odoo")
 
@@ -484,11 +503,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             with self.subTest(name=name):
                 attempt = self._claimed_attempt()
                 self._prepare_login_test_responses(attempt, claims=claims)
-                with self.assertRaises(AccessDenied):
-                    self.env["res.users"].auth_oauth(
-                        self.provider_rec.id,
-                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
-                    )
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
                 attempt.invalidate_recordset(["status"])
                 self.assertEqual(attempt.status, "failed")
                 responses.reset()
@@ -525,11 +543,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             access_token=access_token,
             claims={"at_hash": "wrong-hash"},
         )
-        with self.assertRaises(AccessDenied):
-            self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {"_auth_oidc_attempt_id": invalid_attempt.id, "code": "code-sentinel"},
-            )
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": invalid_attempt.id, "code": "code-sentinel"},
+        )
         invalid_attempt.invalidate_recordset(["status"])
         self.assertEqual(invalid_attempt.status, "failed")
 
@@ -543,11 +560,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             with self.subTest(name=name):
                 attempt = self._claimed_attempt()
                 self._prepare_login_test_responses(attempt, **kwargs)
-                with self.assertRaises(AccessDenied):
-                    self.env["res.users"].auth_oauth(
-                        self.provider_rec.id,
-                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
-                    )
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
                 attempt.invalidate_recordset(["status"])
                 self.assertEqual(attempt.status, "failed")
                 responses.reset()
@@ -565,11 +581,10 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             with self.subTest(name=name):
                 attempt = self._claimed_attempt()
                 self._prepare_login_test_responses(attempt, **kwargs)
-                with self.assertRaises(AccessDenied):
-                    self.env["res.users"].auth_oauth(
-                        self.provider_rec.id,
-                        {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
-                    )
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
                 attempt.invalidate_recordset(["status"])
                 self.assertEqual(attempt.status, "failed")
                 responses.reset()
@@ -597,6 +612,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                 "flow": "id_token_code",
                 "enabled": False,
                 "client_id": "other-client",
+                "auth_endpoint": "https://example.invalid/authorize",
+                "body": "Other OpenID Connect Provider",
             }
         )
         attempt.write({"provider_id": other_provider.id})
@@ -638,6 +655,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                     "name": "Incomplete OpenID Connect Provider",
                     "flow": "id_token_code",
                     "enabled": True,
+                    "auth_endpoint": "https://example.invalid/authorize",
+                    "body": "Incomplete OpenID Connect Provider",
                 }
             )
 
@@ -756,23 +775,21 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
     def test_provider_denial_and_exchange_failure_mark_attempt_failed(self):
         """Test provider and token-endpoint errors are terminal and redacted."""
         denied_attempt = self._claimed_attempt()
-        with self.assertRaises(AccessDenied):
-            self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {
-                    "_auth_oidc_attempt_id": denied_attempt.id,
-                    "error": "provider-error-sentinel",
-                },
-            )
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {
+                "_auth_oidc_attempt_id": denied_attempt.id,
+                "error": "provider-error-sentinel",
+            },
+        )
         denied_attempt.invalidate_recordset(["status"])
         self.assertEqual(denied_attempt.status, "failed")
 
         exchange_attempt = self._claimed_attempt()
         self._prepare_login_test_responses(exchange_attempt, token_status=500)
-        with self.assertRaises(AccessDenied):
-            self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {"_auth_oidc_attempt_id": exchange_attempt.id, "code": "code-sentinel"},
-            )
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": exchange_attempt.id, "code": "code-sentinel"},
+        )
         exchange_attempt.invalidate_recordset(["status"])
         self.assertEqual(exchange_attempt.status, "failed")
