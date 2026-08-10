@@ -197,6 +197,12 @@ verification.
 Changelog
 =========
 
+18.0.1.4.0 2026-08-10
+---------------------
+
+-  Preserve Odoo's native post-login redirect state and remove the
+   redundant attempt redirect field.
+
 18.0.1.3.0 2026-08-10
 ---------------------
 
