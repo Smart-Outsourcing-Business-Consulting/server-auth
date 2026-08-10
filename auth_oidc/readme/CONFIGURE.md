@@ -1,25 +1,59 @@
 ## Setup for Microsoft Entra ID
 
-Create a web application in Microsoft Entra ID with OpenID Connect
-authorization-code flow enabled.
+1. In Microsoft Entra admin center, open **Entra ID** > **App registrations** >
+   the Odoo app > **Overview**. Copy **Application (client) ID** and
+   **Directory (tenant) ID**.
+2. Open **Certificates & secrets** > **Client secrets**, create a secret, copy
+   its **Value** immediately, and record its expiry. Enter the Value, not the
+   Secret ID, in Odoo's **Client Secret** field.
+3. On **Authentication**, register
+   `https://<public-odoo-host>/auth_oauth/signin` as a Web redirect URI for
+   each supported public Odoo host. Do not use wildcard URIs or the old
+   miniOrange callback.
+4. Open **Endpoints** and select **OpenID Connect metadata document**, or open
+   `https://login.microsoftonline.com/<DIRECTORY-TENANT-ID>/v2.0/.well-known/openid-configuration`.
+   Copy its JSON values without hand-editing endpoint strings.
 
-1. Register the exact callback URI for every supported Odoo host:
-   `https://<server>/auth_oauth/signin`. Wildcards are not supported. The
-   callback URI used for a login is derived from the proxy-adjusted Odoo
-   request origin, so verify proxy configuration and every registered branch
-   host before deployment.
+   | Metadata key | Odoo field |
+   | --- | --- |
+   | `authorization_endpoint` | **Authorization URL** |
+   | `token_endpoint` | **Token URL** |
+   | `issuer` | **Issuer** |
+   | `jwks_uri` | **JWKS URL** |
 
-2. Create a new authentication provider in Odoo with the authorization-code
-   flow, `openid` scope, exact issuer, token URL, JWKS URL, and an asymmetric
-   allowed algorithm (RS256 for Microsoft Entra). Set the exact Entra tenant ID
-   when the provider is tenant-restricted.
+5. In Odoo, activate developer mode, then open **Settings** > **Users &
+   Companies** > **OAuth Providers** > **New**. Set **Provider name**, **Auth
+   Flow** to **OpenID Connect (authorization code flow)**, **Client ID**,
+   **Client Secret**, **Login button label**, **Authorization URL**, **Scope**,
+   **Token URL**, **JWKS URL**, **Issuer**, **Tenant ID**, **Allowed
+   Algorithms**, and **Clock Skew Seconds**. Set **Scope** to
+   `openid profile email`, set **Allowed Algorithms** to **RS256**, and set
+   **Clock Skew Seconds** from 0 through 300 seconds. `openid` is required by
+   the adapter; `profile` and `email` request optional name and email claims.
+   An email claim is not guaranteed. **UserInfo URL** is optional and can
+   remain empty. Leave **Allowed** off until the values are reviewed, then
+   enable the provider.
 
-3. Enter the application client ID and, for a confidential client, its client
-   secret. Enable the provider only after every trust value has been reviewed.
+Use the tenant-specific v2 authority for this single-tenant workforce
+application. Do not configure v1 endpoints, `consumers`, `common`, or
+`organizations`. The `jwks_uri` value identifies the HTTPS JSON set of
+Microsoft public signing keys. The `issuer` value is the exact issuer URL from
+metadata that the ID token `iss` claim must match.
 
-![image](../static/description/oauth-microsoft_azure-api_permissions.png)
-
-![image](../static/description/oauth-microsoft_azure-optional_claims.png)
+Microsoft references: [OIDC and
+metadata](https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc),
+[access tokens and signing
+keys](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens),
+[application
+registration](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app),
+[redirect
+URIs](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri),
+[authorization code
+flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow),
+[tenant
+IDs](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant),
+and [application
+credentials](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-credentials).
 
 ## Optional Keycloak setup
 
