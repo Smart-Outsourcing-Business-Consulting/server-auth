@@ -70,6 +70,14 @@ class VerifiedOIDCLoginContext:
         )
 
 
+@dataclass(frozen=True)
+class OIDCFailure:
+    """A redacted terminal OIDC failure notification."""
+
+    reason: str
+    attempt_id: int
+
+
 class ResUsers(models.Model):
     """Authenticate OIDC only after its matching attempt is fully validated."""
 
@@ -112,6 +120,7 @@ class ResUsers(models.Model):
             return self.env.cr.dbname, login, access_token
         except OIDCAuthenticationError as error:
             attempt.mark_failed()
+            self._notify_oidc_failure(oauth_provider, error, attempt)
             _logger.info(
                 "OIDC authentication failed reason=%s provider_id=%s attempt_id=%s",
                 error.reason,
@@ -153,3 +162,22 @@ class ResUsers(models.Model):
             if isinstance(principal.claims.get(name), str):
                 validation[name] = principal.claims[name]
         return self._auth_oauth_signin(provider, validation, native_params)
+
+    @api.model
+    def _notify_oidc_failure(self, provider, error, attempt):
+        """Notify one expected terminal failure without changing its outcome."""
+        failure = OIDCFailure(reason=error.reason, attempt_id=int(attempt.id))
+        try:
+            with self.env.cr.savepoint():
+                self._auth_oidc_failure(provider.id, failure)
+        except Exception:
+            _logger.error(
+                "OIDC failure hook failed provider_id=%s attempt_id=%s",
+                provider.id,
+                attempt.id,
+            )
+
+    @api.model
+    def _auth_oidc_failure(self, provider, failure):
+        """Receive one redacted expected terminal failure notification."""
+        del provider, failure
