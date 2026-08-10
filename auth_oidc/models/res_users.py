@@ -111,11 +111,27 @@ class ResUsers(models.Model):
                 "state": json.dumps(attempt.native_state),
             }
             login_context = VerifiedOIDCLoginContext.from_attempt(attempt)
-            login = self._auth_oidc_signin(
-                oauth_provider.id, principal, login_context, native_params
-            )
-            if not login:
-                raise OIDCAuthenticationError("native_signin_denied")
+            with self.env.cr.savepoint():
+                login = self._auth_oidc_signin(
+                    oauth_provider.id, principal, login_context, native_params
+                )
+                if not login:
+                    raise OIDCAuthenticationError("native_signin_denied")
+                final_user = self.with_context(active_test=False).search(
+                    [
+                        ("oauth_provider_id", "=", oauth_provider.id),
+                        ("oauth_uid", "=", principal.subject),
+                    ]
+                )
+                if (
+                    len(final_user) != 1
+                    or not final_user.active
+                    or final_user.login != login
+                ):
+                    raise OIDCAuthenticationError("final_user_mismatch")
+                self._auth_oidc_finalize_user_provisioning(
+                    oauth_provider, principal, login_context, final_user
+                )
             attempt.mark_consumed()
             return self.env.cr.dbname, login, access_token
         except OIDCAuthenticationError as error:
@@ -162,6 +178,13 @@ class ResUsers(models.Model):
             if isinstance(principal.claims.get(name), str):
                 validation[name] = principal.claims[name]
         return self._auth_oauth_signin(provider, validation, native_params)
+
+    @api.model
+    def _auth_oidc_finalize_user_provisioning(
+        self, provider, principal, login_context, user
+    ):
+        """Finalize one verified OIDC user's provisioning before authentication."""
+        del provider, principal, login_context, user
 
     @api.model
     def _notify_oidc_failure(self, provider, error, attempt):
