@@ -35,6 +35,10 @@ picker in the employee form.
 The addon does not create employees, change user groups, or grant portal
 users access to Human Resources data.
 
+User and employee automation belongs to the downstream addon and is
+documented in the pinned `Microsoft Entra ID lifecycle
+guide <https://github.com/Smart-Outsourcing-Business-Consulting/miniorange_oauth_20/blob/57cbba126453e8ab6b4690da9678ec75571ecfb4/docs/entra_sso_administrator_guide.md>`__.
+
 **Table of contents**
 
 .. contents::
@@ -56,7 +60,9 @@ Known issues / Roadmap
 This is an Odoo 18-only compatibility addon. The downstream lifecycle
 addon must remove it during the Odoo 19 upgrade after confirming that no
 custom view inherits ``hr_portal_employee_link.view_employee_form``;
-removing the addon must not change existing employee-user links.
+removing the addon must not change existing employee-user links. The
+bridge is unnecessary in Odoo 19, where the standard employee form
+already permits portal users in the Related User picker.
 
 Bug Tracker
 ===========
