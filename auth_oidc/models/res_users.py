@@ -74,7 +74,9 @@ class ResUsers(models.Model):
             access_token, id_token = oauth_provider.exchange_authorization_code(
                 attempt, params.get("code")
             )
-            verified_claims = oauth_provider.verify_id_token(id_token, attempt)
+            verified_claims = oauth_provider.verify_id_token(
+                id_token, access_token, attempt
+            )
             principal = VerifiedOIDCPrincipal.from_verified_claims(
                 oauth_provider.id, verified_claims
             )

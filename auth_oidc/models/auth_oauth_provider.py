@@ -10,7 +10,8 @@ from types import MappingProxyType
 
 import requests
 
-from odoo import fields, models
+from odoo import api, fields, models
+from odoo.exceptions import ValidationError
 
 try:
     from jose import jwt
@@ -77,6 +78,51 @@ class AuthOauthProvider(models.Model):
     clock_skew_seconds = fields.Integer(default=60, required=True)
     end_session_endpoint = fields.Char(string="End Session URL")
 
+    @api.constrains(
+        "enabled",
+        "flow",
+        "client_id",
+        "scope",
+        "token_endpoint",
+        "jwks_uri",
+        "issuer",
+        "allowed_algorithms",
+        "clock_skew_seconds",
+    )
+    def _check_enabled_oidc_configuration(self):
+        """Reject enabled OIDC rows that cannot satisfy the strict contract."""
+        for provider in self:
+            if provider.flow != "id_token_code":
+                continue
+            if not 0 <= provider.clock_skew_seconds <= 300:
+                raise ValidationError(
+                    "OpenID Connect clock skew must be between 0 and 300 seconds."
+                )
+            if not provider.enabled:
+                continue
+            if (
+                not all(
+                    (
+                        provider.client_id,
+                        provider.token_endpoint,
+                        provider.jwks_uri,
+                        provider.issuer,
+                    )
+                )
+                or "openid" not in (provider.scope or "").split()
+            ):
+                raise ValidationError(
+                    "Enabled OpenID Connect providers require client ID, OpenID scope, "
+                    "token URL, JWKS URL, and exact issuer."
+                )
+            try:
+                provider._allowed_algorithms()
+            except OIDCAuthenticationError as error:
+                raise ValidationError(
+                    "Enabled OpenID Connect provider algorithm configuration "
+                    "is invalid."
+                ) from error
+
     def _allowed_algorithms(self):
         """Return the configured non-empty asymmetric JWT algorithm allowlist."""
         self.ensure_one()
@@ -140,7 +186,7 @@ class AuthOauthProvider(models.Model):
             raise OIDCAuthenticationError("missing_id_token")
         return access_token, id_token
 
-    def verify_id_token(self, id_token, attempt):
+    def verify_id_token(self, id_token, access_token, attempt):
         """Return immutable claims after signature and complete semantic checks."""
         self.ensure_one()
         if jwt is None:
@@ -154,11 +200,13 @@ class AuthOauthProvider(models.Model):
         algorithms = self._allowed_algorithms()
         if header.get("alg") not in algorithms:
             raise OIDCAuthenticationError("algorithm_not_allowed")
-        claims = self._decode_with_jwks(id_token, header.get("kid"), algorithms)
+        claims = self._decode_with_jwks(
+            id_token, access_token, header.get("kid"), algorithms
+        )
         self._check_claims(claims, attempt)
         return VerifiedOIDCClaims(claims)
 
-    def _decode_with_jwks(self, id_token, kid, algorithms):
+    def _decode_with_jwks(self, id_token, access_token, kid, algorithms):
         """Decode a signed ID token against one of the current matching JWKS keys."""
         for key in self._get_keys(kid):
             try:
@@ -167,9 +215,14 @@ class AuthOauthProvider(models.Model):
                     key,
                     algorithms=algorithms,
                     audience=self.client_id,
+                    access_token=access_token,
                     issuer=self.issuer,
                     options={
-                        "require": ["exp", "nbf", "iat", "iss", "aud"],
+                        "require_exp": True,
+                        "require_nbf": True,
+                        "require_iat": True,
+                        "require_iss": True,
+                        "require_aud": True,
                         "verify_aud": True,
                         "verify_iss": True,
                         "leeway": self.clock_skew_seconds,
