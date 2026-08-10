@@ -29,13 +29,16 @@ Authentication OpenID Connect
 |badge1| |badge2| |badge3| |badge4| |badge5|
 
 This module adds a strict OpenID Connect authorization-code adapter to
-Odoo. Each login uses server-side state, nonce, and PKCE material; the
-adapter then validates the token signature and required claims before it
-hands an immutable principal to Odoo's native OAuth sign-in flow.
+Odoo. Each login uses server-side state, nonce, and PKCE material. The
+adapter validates the signed ID token and its required claims before it
+hands an immutable principal to native Odoo authentication or a typed
+downstream hook.
 
 Implicit and hybrid browser-token flows are not supported. This addon
-does not choose user types, groups, companies, or employee records; a
-downstream policy addon owns those decisions.
+does not choose user types, groups, companies, or employee records.
+Those decisions belong to the downstream policy addon and are documented
+in the pinned `Microsoft Entra ID lifecycle
+guide <https://github.com/Smart-Outsourcing-Business-Consulting/miniorange_oauth_20/blob/57cbba126453e8ab6b4690da9678ec75571ecfb4/docs/entra_sso_administrator_guide.md>`__.
 
 **Table of contents**
 
@@ -52,27 +55,27 @@ be confused with ``jose`` which is also available on PyPI.
 Configuration
 =============
 
-Setup for Microsoft Azure
--------------------------
+Setup for Microsoft Entra ID
+----------------------------
 
-Example configuration with the required OpenID Connect
-authorization-code flow.
+Create a web application in Microsoft Entra ID with OpenID Connect
+authorization-code flow enabled.
 
-1. configure a new web application in Azure with OpenID and code flow
-   (see the `provider
-   documentation <https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-provider>`__))
-
-2. Register the exact callback URI for every supported Odoo host:
+1. Register the exact callback URI for every supported Odoo host:
    ``https://<server>/auth_oauth/signin``. Wildcards are not supported.
    The callback URI used for a login is derived from the proxy-adjusted
    Odoo request origin, so verify proxy configuration and every
    registered branch host before deployment.
 
-3. Create a new authentication provider in Odoo with the
+2. Create a new authentication provider in Odoo with the
    authorization-code flow, ``openid`` scope, exact issuer, token URL,
    JWKS URL, and an asymmetric allowed algorithm (RS256 for Microsoft
-   Entra). Set the Entra tenant ID when the provider is
+   Entra). Set the exact Entra tenant ID when the provider is
    tenant-restricted.
+
+3. Enter the application client ID and, for a confidential client, its
+   client secret. Enable the provider only after every trust value has
+   been reviewed.
 
 .. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-api_permissions.png
    :alt: image
@@ -80,59 +83,37 @@ authorization-code flow.
 .. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-optional_claims.png
    :alt: image
 
-Single tenant provider limits the access to user of your tenant, while
-Multitenants allow access for all AzureAD users, so user of foreign
-companies can use their AzureAD login without an guest account.
+Optional Keycloak setup
+-----------------------
 
--  Provider Name: Azure AD Single Tenant
--  Client ID: Application (client) id
--  Client Secret: Client secret
--  Allowed: yes
-
-or
-
--  Provider Name: Azure AD Multitenant
--  Client ID: Application (client) id
--  Client Secret: Client secret
--  Allowed: yes
--  replace {tenant_id} in urls with your Azure tenant id
-
-.. image:: https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/odoo-azure_ad_multitenant.png
-   :alt: image
-
-Setup for Keycloak
-------------------
-
-Example configuration with the required OpenID Connect
-authorization-code flow.
+Keycloak is an optional standards-compliant provider for this adapter.
+The Microsoft Entra lifecycle addon does not install, contact, or depend
+on Keycloak.
 
 In Keycloak:
 
-1. configure a new Client
-2. make sure Authorization Code Flow is Enabled.
-3. configure the client Access Type as "confidential" and take note of
-   the client secret in the Credentials tab
-4. register the exact redirect URL
-   ``https://<server>/auth_oauth/signin`` for every supported Odoo host
+1. Configure a new client.
+2. Enable Authorization Code Flow.
+3. Configure a confidential client and note its client secret.
+4. Register the exact redirect URL
+   ``https://<server>/auth_oauth/signin`` for every supported Odoo host.
 
-In Odoo, create a new Oauth Provider with the following parameters:
+In Odoo, create an OAuth Provider with these settings:
 
--  Provider name: Keycloak (or any name you like that identify your
-   keycloak provider)
+-  Provider name: Keycloak
 -  Auth Flow: OpenID Connect (authorization code flow)
--  Client ID: the same Client ID you entered when configuring the client
-   in Keycloak
--  Client Secret: found in keycloak on the client Credentials tab
+-  Client ID: the client ID configured in Keycloak
+-  Client Secret: the secret from the Keycloak Credentials tab
 -  Allowed: yes
 -  Body: the link text to appear on the login page, such as Login with
    Keycloak
 -  Scope: openid email
--  Authentication URL: The "authorization_endpoint" URL found in the
-   OpenID Endpoint Configuration of your Keycloak realm
--  Token URL: The "token_endpoint" URL found in the OpenID Endpoint
-   Configuration of your Keycloak realm
--  JWKS URL: The "jwks_uri" URL found in the OpenID Endpoint
-   Configuration of your Keycloak realm
+-  Authentication URL: the ``authorization_endpoint`` URL from the
+   realm's OpenID Endpoint Configuration
+-  Token URL: the ``token_endpoint`` URL from the realm's OpenID
+   Endpoint Configuration
+-  JWKS URL: the ``jwks_uri`` URL from the realm's OpenID Endpoint
+   Configuration
 -  Issuer: the exact issuer from the OpenID Endpoint Configuration
 -  Allowed Algorithms: the asymmetric signing algorithm used by the
    realm
@@ -141,15 +122,40 @@ Usage
 =====
 
 On the login page, click the authentication provider you configured. The
-provider must use the authorization-code flow. Odoo completes account
-lookup, authentication, session rotation, and the final local redirect
-only after this addon verifies the OIDC response.
+provider must use the authorization-code flow.
+
+The adapter creates a server-side attempt for the current browser
+session, provider, and database. It sends opaque state, a nonce, and an
+S256 PKCE challenge. The attempt expires after 10 minutes and can be
+claimed only once; the nonce and PKCE verifier are not placed in
+browser-visible state.
+
+On callback, the adapter exchanges the code with the stored verifier and
+validates the token algorithm, signature, times, audience, authorized
+party when required, exact issuer, nonce, optional tenant ID, and
+non-empty subject. Only immutable validated claims reach the extension
+hook.
+
+If correlation, exchange, validation, or handoff fails, the callback
+records a fixed terminal reason and redirects locally to ``/web/login``.
+It does not place the authorization code, tokens, claims, or provider
+response in the redirect. A new browser login attempt is required after
+failure.
+
+The default hook may use native account lookup. A downstream lifecycle
+policy may perform account lookup and provisioning before it invokes the
+native terminal path. Native Odoo retains credential authentication,
+session rotation, and the final local redirect.
 
 Known issues / Roadmap
 ======================
 
 Provider-initiated logout and long-lived token management are outside
 this addon's authorization-code login scope.
+
+The documented flow is source-established. Database, browser,
+concurrency, and live-provider checks remain separate deployment
+verification.
 
 Changelog
 =========
