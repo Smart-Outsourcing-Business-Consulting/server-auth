@@ -6,9 +6,9 @@
 """OpenID Connect authorization start and callback correlation."""
 
 import json
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from werkzeug.urls import url_decode, url_encode, url_quote_plus
+from werkzeug.urls import url_decode, url_encode
 
 from odoo import SUPERUSER_ID, api, http
 from odoo import registry as registry_get
@@ -33,9 +33,7 @@ class OpenIDLogin(OAuthLogin):
                 continue
             params = url_decode(provider["auth_link"].split("?", 1)[-1])
             callback_uri = self._callback_uri()
-            redirect_path = self._safe_redirect_path(request.params.get("redirect"))
             native_state = self.get_state(provider)
-            native_state["r"] = url_quote_plus(redirect_path)
             native_state["d"] = request.session.db
             native_state["p"] = provider["id"]
             attempt, state = request.env[
@@ -45,7 +43,6 @@ class OpenIDLogin(OAuthLogin):
                 request.session.db,
                 request.session.sid,
                 native_state,
-                redirect_path,
                 self._website_id(),
                 callback_uri,
             )
@@ -75,31 +72,6 @@ class OpenIDLogin(OAuthLogin):
         """Return the initiating website identifier when website is installed."""
         website = getattr(request, "website", None)
         return website.id if website else False
-
-    @staticmethod
-    def _safe_redirect_path(redirect):
-        """Normalize one local post-login path or return the safe default."""
-        value = redirect or "/odoo"
-        if not isinstance(value, str):
-            return "/odoo"
-        for _index in range(3):
-            decoded = unquote(value)
-            if decoded == value:
-                break
-            value = decoded
-        else:
-            return "/odoo"
-        if (
-            not value.startswith("/")
-            or value.startswith("//")
-            or "\\" in value
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        ):
-            return "/odoo"
-        parsed = urlsplit(value)
-        if parsed.scheme or parsed.netloc or parsed.username or parsed.password:
-            return "/odoo"
-        return value
 
 
 class OpenIDController(OAuthController):

@@ -9,7 +9,7 @@ import logging
 import time
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import responses
 from cryptography.hazmat.primitives import serialization
@@ -121,7 +121,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.assertEqual(attempt.provider_id, self.provider_rec)
             self.assertEqual(attempt.database_name, self.env.cr.dbname)
             self.assertEqual(attempt.status, "pending")
-            self.assertEqual(attempt.redirect_path, "/odoo")
+            self.assertEqual(unquote_plus(attempt.native_state["r"]), BASE_URL + "/web")
             self.assertEqual(attempt.callback_uri, BASE_URL + "/auth_oauth/signin")
             self.assertEqual(
                 {
@@ -147,8 +147,8 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                 },
             )
 
-    def test_authorization_attempts_are_fresh_and_bind_local_redirect(self):
-        """Test that every authorization URL has isolated, local-only state."""
+    def test_authorization_attempts_are_fresh_and_preserve_native_state(self):
+        """Test that each authorization URL binds fresh native OAuth state."""
         self.env["auth.oauth.provider"].search(
             [("client_id", "!=", "auth_oidc-test")]
         ).write({"enabled": False})
@@ -167,33 +167,11 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         attempts = self.env["auth.oidc.login.attempt"].search(
             [("provider_id", "=", self.provider_rec.id)], order="id desc", limit=2
         )
-        self.assertEqual(attempts.mapped("redirect_path"), ["/web#home", "/web#home"])
-        self.assertTrue(all(attempt.code_verifier for attempt in attempts))
-
-    def test_unsafe_redirect_defaults_to_odoo(self):
-        """Test that protocol and encoded redirect bypasses are rejected."""
-        unsafe_redirects = (
-            "https://attacker.invalid/",
-            "//attacker.invalid/",
-            "/%2f%2fattacker.invalid/",
-            "/%5cattacker.invalid/",
-            "/%252f%252fattacker.invalid/",
-            "/%2525252f%2525252fattacker.invalid/",
-            "/web\\attacker",
+        self.assertEqual(
+            [unquote_plus(attempt.native_state["r"]) for attempt in attempts],
+            [BASE_URL + "/web#home", BASE_URL + "/web#home"],
         )
-        for redirect in unsafe_redirects:
-            with MockRequest(self.env) as mock_request:
-                mock_request.params = {"redirect": redirect}
-                auth_link = next(
-                    provider["auth_link"]
-                    for provider in OpenIDLogin().list_providers()
-                    if provider["id"] == self.provider_rec.id
-                )
-            state = parse_qs(urlparse(auth_link).query)["state"][0]
-            attempt = self.env["auth.oidc.login.attempt"].search(
-                [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
-            )
-            self.assertEqual(attempt.redirect_path, "/odoo")
+        self.assertTrue(all(attempt.code_verifier for attempt in attempts))
 
     def test_attempt_claim_is_session_bound_and_one_time(self):
         """Test that only the initiating session can atomically claim state."""
@@ -203,7 +181,6 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.env.cr.dbname,
             "initial-session",
             {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
-            "/odoo",
             False,
             BASE_URL + "/auth_oauth/signin",
         )
@@ -280,7 +257,6 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.env.cr.dbname,
             "token-test-session",
             {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
-            "/odoo",
             False,
             BASE_URL + "/auth_oauth/signin",
         )
@@ -295,7 +271,6 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.env.cr.dbname,
             "auth-oidc-test-session",
             {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
-            "/odoo",
             False,
             BASE_URL + "/auth_oauth/signin",
         )
@@ -314,7 +289,6 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             "attempt",
             "database_name",
             "session_fingerprint",
-            "redirect_path",
             "callback_uri",
             "nonce",
             "code_verifier",

@@ -26,7 +26,6 @@ class AuthOIDCLoginAttempt(models.Model):
     session_fingerprint = fields.Char(required=True, index=True)
     state_digest = fields.Char(required=True, index=True, copy=False)
     native_state = fields.Json(required=True, copy=False)
-    redirect_path = fields.Char(required=True, copy=False)
     website_id = fields.Integer(copy=False)
     callback_uri = fields.Char(required=True, copy=False)
     nonce = fields.Char(required=True, copy=False)
@@ -73,7 +72,6 @@ class AuthOIDCLoginAttempt(models.Model):
         database_name,
         session_id,
         native_state,
-        redirect_path,
         website_id,
         callback_uri,
     ):
@@ -89,7 +87,6 @@ class AuthOIDCLoginAttempt(models.Model):
                 "session_fingerprint": self._session_fingerprint(session_id),
                 "state_digest": self._state_digest(state),
                 "native_state": native_state,
-                "redirect_path": redirect_path,
                 "website_id": website_id,
                 "callback_uri": callback_uri,
                 "nonce": nonce,
