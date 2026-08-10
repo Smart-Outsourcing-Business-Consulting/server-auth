@@ -6,7 +6,7 @@
 """OpenID Connect authorization start and callback correlation."""
 
 import json
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from werkzeug.urls import url_decode, url_encode, url_quote_plus
 
@@ -118,7 +118,21 @@ class OpenIDController(OAuthController):
             return self._generic_failure()
         kw["state"] = json.dumps(attempt.native_state)
         kw["_auth_oidc_attempt_id"] = attempt.id
-        return super().signin(**kw)
+        response = super().signin(**kw)
+        if self._is_native_failure_redirect(response):
+            return self._generic_failure()
+        return response
+
+    @staticmethod
+    def _is_native_failure_redirect(response):
+        """Return whether native OAuth converted this callback to a login error."""
+        location = getattr(response, "location", None)
+        if not location:
+            return False
+        parsed = urlsplit(location)
+        return parsed.path == "/web/login" and "oauth_error" in parse_qs(
+            parsed.query, keep_blank_values=True
+        )
 
     @staticmethod
     def _is_non_oidc_native_state(state):
