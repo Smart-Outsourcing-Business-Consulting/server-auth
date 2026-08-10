@@ -424,25 +424,84 @@ be confused with <tt class="docutils literal">jose</tt> which is also available 
 <h1><a class="toc-backref" href="#toc-entry-2">Configuration</a></h1>
 <div class="section" id="setup-for-microsoft-entra-id">
 <h2><a class="toc-backref" href="#toc-entry-3">Setup for Microsoft Entra ID</a></h2>
-<p>Create a web application in Microsoft Entra ID with OpenID Connect
-authorization-code flow enabled.</p>
-<ol class="arabic simple">
-<li>Register the exact callback URI for every supported Odoo host:
-<tt class="docutils literal"><span class="pre">https://&lt;server&gt;/auth_oauth/signin</span></tt>. Wildcards are not supported.
-The callback URI used for a login is derived from the proxy-adjusted
-Odoo request origin, so verify proxy configuration and every
-registered branch host before deployment.</li>
-<li>Create a new authentication provider in Odoo with the
-authorization-code flow, <tt class="docutils literal">openid</tt> scope, exact issuer, token URL,
-JWKS URL, and an asymmetric allowed algorithm (RS256 for Microsoft
-Entra). Set the exact Entra tenant ID when the provider is
-tenant-restricted.</li>
-<li>Enter the application client ID and, for a confidential client, its
-client secret. Enable the provider only after every trust value has
-been reviewed.</li>
+<ol class="arabic">
+<li><p class="first">In Microsoft Entra admin center, open <strong>Entra ID</strong> &gt; <strong>App
+registrations</strong> &gt; the Odoo app &gt; <strong>Overview</strong>. Copy <strong>Application
+(client) ID</strong> and <strong>Directory (tenant) ID</strong>.</p>
+</li>
+<li><p class="first">Open <strong>Certificates &amp; secrets</strong> &gt; <strong>Client secrets</strong>, create a
+secret, copy its <strong>Value</strong> immediately, and record its expiry. Enter
+the Value, not the Secret ID, in Odoo’s <strong>Client Secret</strong> field.</p>
+</li>
+<li><p class="first">On <strong>Authentication</strong>, register
+<tt class="docutils literal"><span class="pre">https://&lt;public-odoo-host&gt;/auth_oauth/signin</span></tt> as a Web redirect
+URI for each supported public Odoo host. Do not use wildcard URIs or
+the old miniOrange callback.</p>
+</li>
+<li><p class="first">Open <strong>Endpoints</strong> and select <strong>OpenID Connect metadata document</strong>,
+or open
+<tt class="docutils literal"><span class="pre">https://login.microsoftonline.com/&lt;DIRECTORY-TENANT-ID&gt;/v2.0/.well-known/openid-configuration</span></tt>.
+Copy its JSON values without hand-editing endpoint strings.</p>
+<table border="1" class="docutils">
+<colgroup>
+<col width="55%" />
+<col width="45%" />
+</colgroup>
+<thead valign="bottom">
+<tr><th class="head">Metadata key</th>
+<th class="head">Odoo field</th>
+</tr>
+</thead>
+<tbody valign="top">
+<tr><td><tt class="docutils literal">authorization_endpoint</tt></td>
+<td><strong>Authorization URL</strong></td>
+</tr>
+<tr><td><tt class="docutils literal">token_endpoint</tt></td>
+<td><strong>Token URL</strong></td>
+</tr>
+<tr><td><tt class="docutils literal">issuer</tt></td>
+<td><strong>Issuer</strong></td>
+</tr>
+<tr><td><tt class="docutils literal">jwks_uri</tt></td>
+<td><strong>JWKS URL</strong></td>
+</tr>
+</tbody>
+</table>
+</li>
+<li><p class="first">In Odoo, activate developer mode, then open <strong>Settings</strong> &gt; <strong>Users &amp;
+Companies</strong> &gt; <strong>OAuth Providers</strong> &gt; <strong>New</strong>. Set <strong>Provider name</strong>,
+<strong>Auth Flow</strong> to <strong>OpenID Connect (authorization code flow)</strong>,
+<strong>Client ID</strong>, <strong>Client Secret</strong>, <strong>Login button label</strong>,
+<strong>Authorization URL</strong>, <strong>Scope</strong>, <strong>Token URL</strong>, <strong>JWKS URL</strong>,
+<strong>Issuer</strong>, <strong>Tenant ID</strong>, <strong>Allowed Algorithms</strong>, and <strong>Clock Skew
+Seconds</strong>. Set <strong>Scope</strong> to <tt class="docutils literal">openid profile email</tt>, set <strong>Allowed
+Algorithms</strong> to <strong>RS256</strong>, and set <strong>Clock Skew Seconds</strong> from 0
+through 300 seconds. <tt class="docutils literal">openid</tt> is required by the adapter;
+<tt class="docutils literal">profile</tt> and <tt class="docutils literal">email</tt> request optional name and email claims. An
+email claim is not guaranteed. <strong>UserInfo URL</strong> is optional and can
+remain empty. Leave <strong>Allowed</strong> off until the values are reviewed,
+then enable the provider.</p>
+</li>
 </ol>
-<img alt="image" src="https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-api_permissions.png" />
-<img alt="image" src="https://raw.githubusercontent.com/OCA/server-auth/18.0/auth_oidc/static/description/oauth-microsoft_azure-optional_claims.png" />
+<p>Use the tenant-specific v2 authority for this single-tenant workforce
+application. Do not configure v1 endpoints, <tt class="docutils literal">consumers</tt>, <tt class="docutils literal">common</tt>,
+or <tt class="docutils literal">organizations</tt>. The <tt class="docutils literal">jwks_uri</tt> value identifies the HTTPS JSON
+set of Microsoft public signing keys. The <tt class="docutils literal">issuer</tt> value is the exact
+issuer URL from metadata that the ID token <tt class="docutils literal">iss</tt> claim must match.</p>
+<p>Microsoft references: <a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc">OIDC and
+metadata</a>,
+<a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens">access tokens and signing
+keys</a>,
+<a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app">application
+registration</a>,
+<a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri">redirect
+URIs</a>,
+<a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow">authorization code
+flow</a>,
+<a class="reference external" href="https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant">tenant
+IDs</a>,
+and <a class="reference external" href="https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-credentials">application
+credentials</a>.</p>
 </div>
 <div class="section" id="optional-keycloak-setup">
 <h2><a class="toc-backref" href="#toc-entry-4">Optional Keycloak setup</a></h2>
