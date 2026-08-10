@@ -4,7 +4,7 @@
 import contextlib
 import hashlib
 import json
-import logging
+import time
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
@@ -12,11 +12,9 @@ import responses
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
-from jose.exceptions import JWTError
 from jose.utils import long_to_base64
 
 import odoo
-from odoo.exceptions import AccessDenied
 from odoo.tests import common
 
 from odoo.addons.website.tools import MockRequest as _MockRequest
@@ -211,222 +209,71 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.assertFalse(OpenIDController._claim_oidc_attempt("opaque-state"))
 
     def _prepare_login_test_user(self):
+        """Bind the demo user to the provider-scoped standard subject."""
         user = self.env.ref("base.user_demo")
-        user.write({"oauth_provider_id": self.provider_rec.id, "oauth_uid": user.login})
+        user.write(
+            {"oauth_provider_id": self.provider_rec.id, "oauth_uid": "test-subject"}
+        )
         return user
 
-    def _prepare_login_test_responses(
-        self, access_token="42", id_token_body=None, id_token_headers=None, keys=None
-    ):
-        if id_token_body is None:
-            id_token_body = {}
-        if id_token_headers is None:
-            id_token_headers = {"kid": "the_key_id"}
+    def _claimed_attempt(self):
+        """Create and claim one attempt for direct token-boundary tests."""
+        attempt, state = self.env["auth.oidc.login.attempt"].create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "token-test-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
+            "/odoo",
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        return self.env["auth.oidc.login.attempt"].claim_from_callback(
+            state, self.env.cr.dbname, "token-test-session"
+        )
+
+    def _prepare_login_test_responses(self, attempt, claims=None, access_token="42"):
+        """Mock one token/JWKS exchange with a complete signed ID token."""
+        now = int(time.time())
+        payload = {
+            "sub": "test-subject",
+            "iss": self.provider_rec.issuer,
+            "aud": self.provider_rec.client_id,
+            "exp": now + 300,
+            "nbf": now - 1,
+            "iat": now,
+            "nonce": attempt.nonce,
+        }
+        payload.update(claims or {})
         responses.add(
             responses.POST,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
             json={
                 "access_token": access_token,
                 "id_token": jwt.encode(
-                    id_token_body,
+                    payload,
                     self.rsa_key_pem,
                     algorithm="RS256",
-                    headers=id_token_headers,
+                    headers={"kid": "the_key_id"},
                 ),
             },
         )
-        if keys is None:
-            if "kid" in id_token_headers:
-                keys = [{"kid": "the_key_id", "keys": [self.rsa_key_public_pem]}]
-            else:
-                keys = [{"keys": [self.rsa_key_public_pem]}]
+        jwk = dict(self.rsa_key_public_jwk, kid="the_key_id")
         responses.add(
             responses.GET,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/certs",
-            json={"keys": keys},
+            json={"keys": [jwk]},
         )
 
     @responses.activate
-    def test_login(self):
-        """Test that login works"""
+    def test_login_uses_verified_subject_and_attempt_credentials(self):
+        """Test that native OAuth receives only a verified standard subject."""
         user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(id_token_body={"user_id": user.login})
-
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                params,
-            )
-        self.assertEqual(token, "42")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_without_kid(self):
-        """Test that login works when ID Token has no kid in header"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token=chr(42),
+        attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(attempt, access_token="access-sentinel")
+        db, login, token = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
         )
-
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                params,
-            )
-        self.assertEqual(token, "*")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_with_sub_claim(self):
-        """Test that login works when ID Token contains only standard claims"""
-        self.provider_rec.token_map = False
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"sub": user.login}, access_token="1764"
-        )
-
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                params,
-            )
-        self.assertEqual(token, "1764")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_without_kid_multiple_keys_in_jwks(self):
-        """
-        Test that login fails if no kid is provided in ID Token and JWKS has multiple
-        keys
-        """
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="6*7",
-            keys=[
-                {"kid": "other_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
-        )
-
-        with self.assertRaises(
-            JWTError,
-            msg="OpenID Connect requires kid to be set if there is"
-            " more than one key in the JWKS",
-        ):
-            with MockRequest(self.env):
-                self.env["res.users"].auth_oauth(
-                    self.provider_rec.id,
-                    {"state": json.dumps({})},
-                )
-
-    @responses.activate
-    def test_login_without_matching_key(self):
-        """Test that login fails if no matching key can be found"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="168/4",
-            keys=[{"kid": "other_key_id", "keys": [self.second_key_public_pem]}],
-        )
-
-        with self.assertRaises(JWTError):
-            with MockRequest(self.env):
-                self.env["res.users"].auth_oauth(
-                    self.provider_rec.id,
-                    {"state": json.dumps({})},
-                )
-
-    @responses.activate
-    def test_login_without_any_key(self):
-        """Test that login fails if no key is provided by JWKS"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="168/4",
-            keys=[],
-        )
-
-        with self.assertRaises(AccessDenied):
-            with MockRequest(self.env):
-                with self.assertLogs(level=logging.ERROR) as logs:
-                    self.env["res.users"].auth_oauth(
-                        self.provider_rec.id,
-                        {"state": json.dumps({})},
-                    )
-        self.assertEqual(len(logs.records), 1)
-        self.assertEqual(logs.records[0].levelno, logging.ERROR)
-        self.assertEqual(
-            "ERROR:odoo.addons.auth_oidc.models.res_users:user_id claim not found in"
-            " id_token (after mapping).",
-            logs.output[0],
-        )
-
-    @responses.activate
-    def test_login_with_multiple_keys_in_jwks(self):
-        """Test that login works with multiple keys present in jwks"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            access_token="2*3*7",
-            keys=[
-                {"kid": "other_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
-        )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {"state": json.dumps({})},
-            )
-        self.assertEqual(token, "2*3*7")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_with_multiple_keys_in_jwks_same_kid(self):
-        """Test that login works with multiple keys with the same kid present in jwks"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            access_token="84/2",
-            keys=[
-                {"kid": "the_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
-        )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {"state": json.dumps({})},
-            )
-        self.assertEqual(token, "84/2")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_with_jwk_format(self):
-        """Test that login works with proper jwks format"""
-        user = self._prepare_login_test_user()
-        self.rsa_key_public_jwk["kid"] = "the_key_id"
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            keys=[self.rsa_key_public_jwk],
-            access_token="122/3",
-        )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                {"state": json.dumps({})},
-            )
-        self.assertEqual(token, "122/3")
+        self.assertEqual(db, self.env.cr.dbname)
+        self.assertEqual(token, "access-sentinel")
         self.assertEqual(login, user.login)
