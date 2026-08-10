@@ -100,14 +100,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             auth_link = providers[0]["auth_link"]
             assert auth_link.startswith(self.provider_rec.auth_endpoint)
             params = parse_qs(urlparse(auth_link).query)
-            self.assertEqual(params["response_type"], ["code"])
             self.assertEqual(params["client_id"], [self.provider_rec.client_id])
-            self.assertEqual(params["scope"], ["openid email"])
-            self.assertTrue(params["code_challenge"])
-            self.assertEqual(params["code_challenge_method"], ["S256"])
-            self.assertTrue(params["nonce"])
-            self.assertTrue(params["state"])
-            self.assertEqual(params["redirect_uri"], [BASE_URL + "/auth_oauth/signin"])
             state = params["state"][0]
             attempt = self.env["auth.oidc.login.attempt"].search(
                 [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
@@ -117,8 +110,29 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             self.assertEqual(attempt.status, "pending")
             self.assertEqual(attempt.redirect_path, "/odoo")
             self.assertEqual(attempt.callback_uri, BASE_URL + "/auth_oauth/signin")
-            self.assertEqual(params["nonce"], [attempt.nonce])
-            self.assertEqual(params["code_challenge"], [attempt.code_challenge()])
+            self.assertEqual(
+                {
+                    key: params[key]
+                    for key in {
+                        "response_type",
+                        "redirect_uri",
+                        "state",
+                        "nonce",
+                        "code_challenge",
+                        "code_challenge_method",
+                        "scope",
+                    }
+                },
+                {
+                    "response_type": ["code"],
+                    "redirect_uri": [BASE_URL + "/auth_oauth/signin"],
+                    "state": [state],
+                    "nonce": [attempt.nonce],
+                    "code_challenge": [attempt.code_challenge()],
+                    "code_challenge_method": ["S256"],
+                    "scope": ["openid email"],
+                },
+            )
 
     def test_authorization_attempts_are_fresh_and_bind_local_redirect(self):
         """Test that every authorization URL has isolated, local-only state."""

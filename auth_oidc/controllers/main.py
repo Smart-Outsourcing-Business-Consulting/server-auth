@@ -49,16 +49,15 @@ class OpenIDLogin(OAuthLogin):
                 self._website_id(),
                 callback_uri,
             )
-            params.update(
-                {
-                    "response_type": "code",
-                    "redirect_uri": callback_uri,
-                    "state": state,
-                    "nonce": attempt.nonce,
-                    "code_challenge": attempt.code_challenge(),
-                    "code_challenge_method": "S256",
-                }
-            )
+            for key, value in {
+                "response_type": "code",
+                "redirect_uri": callback_uri,
+                "state": state,
+                "nonce": attempt.nonce,
+                "code_challenge": attempt.code_challenge(),
+                "code_challenge_method": "S256",
+            }.items():
+                params[key] = value
             if provider.get("scope"):
                 params["scope"] = provider["scope"]
             provider["auth_link"] = "{}?{}".format(
