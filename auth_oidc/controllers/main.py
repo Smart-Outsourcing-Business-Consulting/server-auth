@@ -160,6 +160,6 @@ class OpenIDController(OAuthController):
     def _generic_failure():
         """Return the fixed local failure path without provider information."""
         request.session["auth_oidc_error"] = True
-        response = request.redirect("/odoo", 303)
+        response = request.redirect("/web/login", 303)
         response.autocorrect_location_header = False
         return response
