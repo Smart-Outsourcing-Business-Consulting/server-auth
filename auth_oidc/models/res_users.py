@@ -1,82 +1,131 @@
 # Copyright 2016 ICTSTUDIO <http://www.ictstudio.eu>
 # Copyright 2021 ACSONE SA/NV <https://acsone.eu>
+# Copyright 2026 Smart Outsourcing Business Consulting
 # License: AGPL-3.0 or later (http://www.gnu.org/licenses/agpl)
 
+"""Native Odoo sign-in hand-off for strictly verified OIDC principals."""
+
+import json
 import logging
+from dataclasses import dataclass
+from types import MappingProxyType
 
-import requests
-
-from odoo import api, models
+from odoo import api, fields, models
 from odoo.exceptions import AccessDenied
-from odoo.http import request
+
+from .auth_oauth_provider import OIDCAuthenticationError
 
 _logger = logging.getLogger(__name__)
 
 
-class ResUsers(models.Model):
-    _inherit = "res.users"
-
-    def _auth_oauth_get_tokens_implicit_flow(self, oauth_provider, params):
-        # https://openid.net/specs/openid-connect-core-1_0.html#ImplicitAuthResponse
-        return params.get("access_token"), params.get("id_token")
-
-    def _auth_oauth_get_tokens_auth_code_flow(self, oauth_provider, params):
-        # https://openid.net/specs/openid-connect-core-1_0.html#AuthResponse
-        code = params.get("code")
-        # https://openid.net/specs/openid-connect-core-1_0.html#TokenRequest
-        auth = None
-        if oauth_provider.client_secret:
-            auth = (oauth_provider.client_id, oauth_provider.client_secret)
-        response = requests.post(
-            oauth_provider.token_endpoint,
-            data=dict(
-                client_id=oauth_provider.client_id,
-                grant_type="authorization_code",
-                code=code,
-                code_verifier=oauth_provider.code_verifier,  # PKCE
-                redirect_uri=request.httprequest.url_root + "auth_oauth/signin",
-            ),
-            auth=auth,
-            timeout=10,
+def _freeze_claim_value(value):
+    """Recursively make a JSON-like verified claim value immutable."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_claim_value(item) for key, item in value.items()}
         )
-        response.raise_for_status()
-        response_json = response.json()
-        # https://openid.net/specs/openid-connect-core-1_0.html#TokenResponse
-        return response_json.get("access_token"), response_json.get("id_token")
+    if isinstance(value, list):
+        return tuple(_freeze_claim_value(item) for item in value)
+    return value
+
+
+@dataclass(frozen=True)
+class VerifiedOIDCPrincipal:
+    """The immutable OIDC identity contract exposed to downstream policy."""
+
+    provider_id: int
+    subject: str
+    issuer: str
+    tenant_id: str | None
+    claims: MappingProxyType
+
+    @classmethod
+    def from_verified_claims(cls, provider_id, verified_claims):
+        """Create the only downstream principal from adapter-validated claims."""
+        claims = verified_claims.claims
+        return cls(
+            provider_id=provider_id,
+            subject=verified_claims.subject,
+            issuer=claims["iss"],
+            tenant_id=claims.get("tid"),
+            claims=MappingProxyType(
+                {name: _freeze_claim_value(value) for name, value in claims.items()}
+            ),
+        )
+
+
+class ResUsers(models.Model):
+    """Authenticate OIDC only after its matching attempt is fully validated."""
+
+    _inherit = "res.users"
 
     @api.model
     def auth_oauth(self, provider, params):
-        oauth_provider = self.env["auth.oauth.provider"].browse(provider)
-        if oauth_provider.flow == "id_token":
-            access_token, id_token = self._auth_oauth_get_tokens_implicit_flow(
-                oauth_provider, params
-            )
-        elif oauth_provider.flow == "id_token_code":
-            access_token, id_token = self._auth_oauth_get_tokens_auth_code_flow(
-                oauth_provider, params
-            )
-        else:
+        """Keep native OAuth untouched and route OIDC through the strict boundary."""
+        oauth_provider = self.env["auth.oauth.provider"].browse(provider).exists()
+        if not oauth_provider or oauth_provider.flow != "id_token_code":
             return super().auth_oauth(provider, params)
-        if not access_token:
-            _logger.error("No access_token in response.")
+        attempt = self._claimed_oidc_attempt(
+            oauth_provider, params.get("_auth_oidc_attempt_id")
+        )
+        try:
+            if params.get("error"):
+                raise OIDCAuthenticationError("provider_denied_authorization")
+            access_token, id_token = oauth_provider.exchange_authorization_code(
+                attempt, params.get("code")
+            )
+            verified_claims = oauth_provider.verify_id_token(id_token, attempt)
+            principal = VerifiedOIDCPrincipal.from_verified_claims(
+                oauth_provider.id, verified_claims
+            )
+            native_params = {
+                "access_token": access_token,
+                "state": json.dumps(attempt.native_state),
+            }
+            login = self._auth_oidc_signin(oauth_provider.id, principal, native_params)
+            if not login:
+                raise OIDCAuthenticationError("native_signin_denied")
+            attempt.mark_consumed()
+            return self.env.cr.dbname, login, access_token
+        except OIDCAuthenticationError as error:
+            attempt.mark_failed()
+            _logger.info(
+                "OIDC authentication failed reason=%s provider_id=%s attempt_id=%s",
+                error.reason,
+                oauth_provider.id,
+                attempt.id,
+            )
+            raise AccessDenied() from None
+        except Exception:
+            attempt.mark_failed()
+            _logger.exception(
+                "Unexpected OIDC authentication failure provider_id=%s attempt_id=%s",
+                oauth_provider.id,
+                attempt.id,
+            )
+            raise AccessDenied() from None
+
+    @api.model
+    def _claimed_oidc_attempt(self, oauth_provider, attempt_id):
+        """Return the claimed current-database attempt for this provider or deny."""
+        if not isinstance(attempt_id, int):
             raise AccessDenied()
-        if not id_token:
-            _logger.error("No id_token in response.")
+        attempt = self.env["auth.oidc.login.attempt"].sudo().browse(attempt_id).exists()
+        if (
+            not attempt
+            or attempt.status != "claimed"
+            or attempt.provider_id != oauth_provider
+            or attempt.database_name != self.env.cr.dbname
+            or attempt.expires_at < fields.Datetime.now()
+        ):
             raise AccessDenied()
-        validation = oauth_provider._parse_id_token(id_token, access_token)
-        # required check
-        if "sub" in validation and "user_id" not in validation:
-            # set user_id for auth_oauth, user_id is not an OpenID Connect standard
-            # claim:
-            # https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims
-            validation["user_id"] = validation["sub"]
-        elif not validation.get("user_id"):
-            _logger.error("user_id claim not found in id_token (after mapping).")
-            raise AccessDenied()
-        # retrieve and sign in user
-        params["access_token"] = access_token
-        login = self._auth_oauth_signin(provider, validation, params)
-        if not login:
-            raise AccessDenied()
-        # return user credentials
-        return (self.env.cr.dbname, login, access_token)
+        return attempt
+
+    @api.model
+    def _auth_oidc_signin(self, provider, principal, native_params):
+        """Delegate a verified immutable principal to native OAuth user lookup."""
+        validation = {"user_id": principal.subject}
+        for name in ("email", "name"):
+            if isinstance(principal.claims.get(name), str):
+                validation[name] = principal.claims[name]
+        return self._auth_oauth_signin(provider, validation, native_params)
