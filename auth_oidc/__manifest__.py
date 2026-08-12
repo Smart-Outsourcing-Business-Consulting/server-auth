@@ -4,7 +4,7 @@
 
 {
     "name": "Authentication OpenID Connect",
-    "version": "18.0.1.4.0",
+    "version": "18.0.1.5.0",
     "license": "AGPL-3",
     "author": (
         "ICTSTUDIO, André Schenkels, ACSONE SA/NV, Odoo Community Association (OCA)"
