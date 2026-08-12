@@ -1,72 +1,87 @@
-## Setup for Microsoft Azure
+## Setup for Microsoft Entra ID
 
-Example configuration with OpenID Connect authorization code flow.
+1. In Microsoft Entra admin center, open **Entra ID** > **App registrations** >
+   the Odoo app > **Overview**. Copy **Application (client) ID** and
+   **Directory (tenant) ID**.
+2. Open **Certificates & secrets** > **Client secrets**, create a secret, copy
+   its **Value** immediately, and record its expiry. Enter the Value, not the
+   Secret ID, in Odoo's **Client Secret** field.
+3. On **Authentication**, register
+   `https://<public-odoo-host>/auth_oauth/signin` as a Web redirect URI for
+   each supported public Odoo host. Do not use wildcard URIs or the old
+   miniOrange callback.
+4. Open **Endpoints** and select **OpenID Connect metadata document**, or open
+   `https://login.microsoftonline.com/<DIRECTORY-TENANT-ID>/v2.0/.well-known/openid-configuration`.
+   Copy its JSON values without hand-editing endpoint strings.
 
-1. configure a new web application in Azure with OpenID and code flow (see
-the [provider
-documentation](https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-provider)))
+   | Metadata key | Odoo field |
+   | --- | --- |
+   | `authorization_endpoint` | **Authorization URL** |
+   | `token_endpoint` | **Token URL** |
+   | `issuer` | **Issuer** |
+   | `jwks_uri` | **JWKS URL** |
 
-2. in this application the redirect url must be be "\<url of your
-server\>/auth_oauth/signin" and of course this URL should be reachable
-from Azure
+5. In Odoo, activate developer mode, then open **Settings** > **Users &
+   Companies** > **OAuth Providers** > **New**. Set **Provider name**, **Auth
+   Flow** to **OpenID Connect (authorization code flow)**, **Client ID**,
+   **Client Secret**, **Login button label**, **Authorization URL**, **Scope**,
+   **Token URL**, **JWKS URL**, **Issuer**, **Tenant ID**, **Allowed
+   Algorithms**, and **Clock Skew Seconds**. Set **Scope** to
+   `openid profile email`, set **Allowed Algorithms** to **RS256**, and set
+   **Clock Skew Seconds** from 0 through 300 seconds. `openid` is required by
+   the adapter; `profile` and `email` request optional name and email claims.
+   An email claim is not guaranteed. **UserInfo URL** is optional and can
+   remain empty. Leave **Allowed** off until the values are reviewed, then
+   enable the provider.
 
-3. create a new authentication provider in Odoo with the following
-parameters (see the [portal
-documentation](https://docs.microsoft.com/en-us/powerapps/maker/portals/configure/configure-openid-settings)
-for more information):
+Use the tenant-specific v2 authority for this single-tenant workforce
+application. Do not configure v1 endpoints, `consumers`, `common`, or
+`organizations`. The `jwks_uri` value identifies the HTTPS JSON set of
+Microsoft public signing keys. The `issuer` value is the exact issuer URL from
+metadata that the ID token `iss` claim must match.
 
-![image](../static/description/oauth-microsoft_azure-api_permissions.png)
+Microsoft references: [OIDC and
+metadata](https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc),
+[access tokens and signing
+keys](https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens),
+[application
+registration](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app),
+[redirect
+URIs](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-redirect-uri),
+[authorization code
+flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow),
+[tenant
+IDs](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant),
+and [application
+credentials](https://learn.microsoft.com/en-us/entra/identity-platform/how-to-add-credentials).
 
-![image](../static/description/oauth-microsoft_azure-optional_claims.png)
+## Optional Keycloak setup
 
-Single tenant provider limits the access to user of your tenant, while
-Multitenants allow access for all AzureAD users, so user of foreign
-companies can use their AzureAD login without an guest account.
-
-- Provider Name: Azure AD Single Tenant
-- Client ID: Application (client) id
-- Client Secret: Client secret
-- Allowed: yes
-
-or
-
-- Provider Name: Azure AD Multitenant
-- Client ID: Application (client) id
-- Client Secret: Client secret
-- Allowed: yes
-- replace {tenant_id} in urls with your Azure tenant id
-
-![image](../static/description/odoo-azure_ad_multitenant.png)
-
-## Setup for Keycloak
-
-Example configuration with OpenID Connect authorization code flow.
+Keycloak is an optional standards-compliant provider for this adapter. The
+Microsoft Entra lifecycle addon does not install, contact, or depend on
+Keycloak.
 
 In Keycloak:
 
-1. configure a new Client
-2. make sure Authorization Code Flow is
-Enabled.
-3. configure the client Access Type as "confidential" and take
-note of the client secret in the Credentials tab
-4. configure the
-redirect url to be "\<url of your server\>/auth_oauth/signin"
+1. Configure a new client.
+2. Enable Authorization Code Flow.
+3. Configure a confidential client and note its client secret.
+4. Register the exact redirect URL
+   `https://<server>/auth_oauth/signin` for every supported Odoo host.
 
-In Odoo, create a new Oauth Provider with the following parameters:
+In Odoo, create an OAuth Provider with these settings:
 
-- Provider name: Keycloak (or any name you like that identify your
-  keycloak provider)
+- Provider name: Keycloak
 - Auth Flow: OpenID Connect (authorization code flow)
-- Client ID: the same Client ID you entered when configuring the client
-  in Keycloak
-- Client Secret: found in keycloak on the client Credentials tab
+- Client ID: the client ID configured in Keycloak
+- Client Secret: the secret from the Keycloak Credentials tab
 - Allowed: yes
-- Body: the link text to appear on the login page, such as Login with
-  Keycloak
+- Body: the link text to appear on the login page, such as Login with Keycloak
 - Scope: openid email
-- Authentication URL: The "authorization_endpoint" URL found in the
-  OpenID Endpoint Configuration of your Keycloak realm
-- Token URL: The "token_endpoint" URL found in the OpenID Endpoint
-  Configuration of your Keycloak realm
-- JWKS URL: The "jwks_uri" URL found in the OpenID Endpoint
-  Configuration of your Keycloak realm
+- Authentication URL: the `authorization_endpoint` URL from the realm's
+  OpenID Endpoint Configuration
+- Token URL: the `token_endpoint` URL from the realm's OpenID Endpoint
+  Configuration
+- JWKS URL: the `jwks_uri` URL from the realm's OpenID Endpoint Configuration
+- Issuer: the exact issuer from the OpenID Endpoint Configuration
+- Allowed Algorithms: the asymmetric signing algorithm used by the realm

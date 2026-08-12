@@ -27,9 +27,9 @@ msgid "Client Secret"
 msgstr "Secreto del cliente"
 
 #. module: auth_oidc
-#: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__code_verifier
-msgid "Code Verifier"
-msgstr "Verificador del código"
+#: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__end_session_endpoint
+msgid "End Session URL"
+msgstr ""
 
 #. module: auth_oidc
 #: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__jwks_uri
@@ -58,11 +58,6 @@ msgid "OpenID Connect (authorization code flow)"
 msgstr "OpenID Connect (flujo de código de autorización)"
 
 #. module: auth_oidc
-#: model:ir.model.fields.selection,name:auth_oidc.selection__auth_oauth_provider__flow__id_token
-msgid "OpenID Connect (implicit flow, not recommended)"
-msgstr "OpenID Connect (flujo implícito, no recomendado)"
-
-#. module: auth_oidc
 #: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__token_endpoint
 msgid "Required for OpenID Connect authorization code flow."
 msgstr "Necesario para el flujo de código de autorización de OpenID Connect."
@@ -73,31 +68,9 @@ msgid "Required for OpenID Connect."
 msgstr "Requerido para OpenID Connect."
 
 #. module: auth_oidc
-#: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__token_map
-msgid ""
-"Some Oauth providers don't map keys in their responses exactly as required.  "
-"It is important to ensure user_id and email at least are mapped. For OpenID "
-"Connect user_id is the sub key in the standard."
-msgstr ""
-"Algunos proveedores de Oauth no mapean las claves en sus respuestas "
-"exactamente como se requiere.  Es importante asegurarse de que al menos "
-"user_id y email están mapeados. Para OpenID Connect user_id es la subclave "
-"en el estándar."
-
-#. module: auth_oidc
-#: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__token_map
-msgid "Token Map"
-msgstr "Mapa de Símbolos"
-
-#. module: auth_oidc
 #: model:ir.model.fields,field_description:auth_oidc.field_auth_oauth_provider__token_endpoint
 msgid "Token URL"
 msgstr "URL de la ficha"
-
-#. module: auth_oidc
-#: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__code_verifier
-msgid "Used for PKCE."
-msgstr "Utilizado para PKCE."
 
 #. module: auth_oidc
 #: model:ir.model.fields,help:auth_oidc.field_auth_oauth_provider__client_secret
