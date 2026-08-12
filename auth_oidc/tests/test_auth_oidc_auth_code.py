@@ -1,25 +1,32 @@
 # Copyright 2021 ACSONE SA/NV <https://acsone.eu>
 # License: AGPL-3.0 or later (http://www.gnu.org/licenses/agpl)
 
+import base64
 import contextlib
+import hashlib
 import json
 import logging
-from urllib.parse import parse_qs, urlparse
+import time
+from dataclasses import FrozenInstanceError
+from unittest.mock import patch
+from urllib.parse import parse_qs, unquote_plus, urlparse
 
 import responses
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import jwt
-from jose.exceptions import JWTError
 from jose.utils import long_to_base64
 
 import odoo
-from odoo.exceptions import AccessDenied
+from odoo.exceptions import AccessDenied, ValidationError
 from odoo.tests import common
 
+from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.http_routing.tests.common import MockRequest as _MockRequest
 
-from ..controllers.main import OpenIDLogin
+from ..controllers.main import OpenIDController, OpenIDLogin
+from ..models.auth_oauth_provider import OIDCAuthenticationError
+from ..models.res_users import OIDCFailure, ResUsers, VerifiedOIDCLoginContext
 
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
 
@@ -29,6 +36,8 @@ def MockRequest(env):
     with _MockRequest(env) as request:
         request.httprequest.url_root = BASE_URL + "/"
         request.params = {}
+        request.session.db = env.cr.dbname
+        request.session.sid = "auth-oidc-test-session"
         yield request
 
 
@@ -41,7 +50,11 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             cls.rsa_key_public_pem,
             cls.rsa_key_public_jwk,
         ) = cls._generate_key()
-        _, cls.second_key_public_pem, _ = cls._generate_key()
+        (
+            cls.second_key_pem,
+            cls.second_key_public_pem,
+            cls.second_key_public_jwk,
+        ) = cls._generate_key()
 
     @staticmethod
     def _generate_key():
@@ -70,21 +83,43 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
 
     def setUp(self):
         super().setUp()
-        # set up our test provider to bind the test user to it
         self.provider_rec = self.env["auth.oauth.provider"].create(
             {
                 "name": "OAuth Provider for TestAuthOIDCAuthorizationCodeFlow",
-                "client_id": "auth_oidc-test",
-                "enabled": True,
-                "body": "Config of an oauth provider for tests",
-                "scope": "openid email",
                 "flow": "id_token_code",
-                "auth_endpoint": "http://localhost:8080/auth/realms/master/protocol/openid-connect/auth",
-                "token_endpoint": "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
-                "jwks_uri": "http://localhost:8080/auth/realms/master/protocol/openid-connect/certs",
+                "client_id": "auth_oidc-test",
+                "body": "OIDC provider used only by this test case",
+                "enabled": True,
+                "scope": "openid email",
+                "auth_endpoint": (
+                    "http://localhost:8080/auth/realms/master/"
+                    "protocol/openid-connect/auth"
+                ),
+                "token_endpoint": (
+                    "http://localhost:8080/auth/realms/master/"
+                    "protocol/openid-connect/token"
+                ),
+                "jwks_uri": (
+                    "http://localhost:8080/auth/realms/master/"
+                    "protocol/openid-connect/certs"
+                ),
+                "issuer": "http://localhost:8080/auth/realms/master",
             }
         )
         self.assertEqual(len(self.provider_rec), 1)
+
+    def _auth_oauth_denied(self, provider_id, params):
+        """Run one terminal OIDC failure without the test rollback savepoint."""
+        try:
+            self.env["res.users"].auth_oauth(provider_id, params)
+        except AccessDenied:
+            return
+        self.fail("AccessDenied not raised")
+
+    @staticmethod
+    def _signin_controller_boundary(**params):
+        """Call the controller endpoint without the unrouted HTTP wrapper."""
+        return OpenIDController.signin.original_endpoint(OpenIDController(), **params)
 
     def test_auth_link(self):
         """Test that the authentication link is correct."""
@@ -98,237 +133,755 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
             auth_link = providers[0]["auth_link"]
             assert auth_link.startswith(self.provider_rec.auth_endpoint)
             params = parse_qs(urlparse(auth_link).query)
-            self.assertEqual(params["response_type"], ["code"])
             self.assertEqual(params["client_id"], [self.provider_rec.client_id])
-            self.assertEqual(params["scope"], ["openid email"])
-            self.assertTrue(params["code_challenge"])
-            self.assertEqual(params["code_challenge_method"], ["S256"])
-            self.assertTrue(params["nonce"])
-            self.assertTrue(params["state"])
-            self.assertEqual(params["redirect_uri"], [BASE_URL + "/auth_oauth/signin"])
+            state = params["state"][0]
+            attempt = self.env["auth.oidc.login.attempt"].search(
+                [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
+            )
+            self.assertEqual(attempt.provider_id, self.provider_rec)
+            self.assertEqual(attempt.database_name, self.env.cr.dbname)
+            self.assertEqual(attempt.status, "pending")
+            self.assertEqual(unquote_plus(attempt.native_state["r"]), BASE_URL + "/web")
+            self.assertEqual(attempt.callback_uri, BASE_URL + "/auth_oauth/signin")
+            self.assertEqual(
+                {
+                    key: params[key]
+                    for key in {
+                        "response_type",
+                        "redirect_uri",
+                        "state",
+                        "nonce",
+                        "code_challenge",
+                        "code_challenge_method",
+                        "scope",
+                    }
+                },
+                {
+                    "response_type": ["code"],
+                    "redirect_uri": [BASE_URL + "/auth_oauth/signin"],
+                    "state": [state],
+                    "nonce": [attempt.nonce],
+                    "code_challenge": [attempt.code_challenge()],
+                    "code_challenge_method": ["S256"],
+                    "scope": ["openid email"],
+                },
+            )
+
+    def test_authorization_attempts_are_fresh_and_preserve_native_state(self):
+        """Test that each authorization URL binds fresh native OAuth state."""
+        self.env["auth.oauth.provider"].search(
+            [("client_id", "!=", "auth_oidc-test")]
+        ).write({"enabled": False})
+        with MockRequest(self.env) as mock_request:
+            mock_request.params = {"redirect": "/web#home"}
+            first_url = OpenIDLogin().list_providers()[0]["auth_link"]
+            second_url = OpenIDLogin().list_providers()[0]["auth_link"]
+
+        first_params = parse_qs(urlparse(first_url).query)
+        second_params = parse_qs(urlparse(second_url).query)
+        self.assertNotEqual(first_params["state"], second_params["state"])
+        self.assertNotEqual(first_params["nonce"], second_params["nonce"])
+        self.assertNotEqual(
+            first_params["code_challenge"], second_params["code_challenge"]
+        )
+        attempts = self.env["auth.oidc.login.attempt"].search(
+            [("provider_id", "=", self.provider_rec.id)], order="id desc", limit=2
+        )
+        self.assertEqual(
+            [unquote_plus(attempt.native_state["r"]) for attempt in attempts],
+            [BASE_URL + "/web#home", BASE_URL + "/web#home"],
+        )
+        self.assertTrue(all(attempt.code_verifier for attempt in attempts))
+
+    def test_attempt_claim_is_session_bound_and_one_time(self):
+        """Test that only the initiating session can atomically claim state."""
+        attempt_model = self.env["auth.oidc.login.attempt"]
+        attempt, state = attempt_model.create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "initial-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        self.assertFalse(
+            attempt_model.claim_from_callback(
+                state, self.env.cr.dbname, "different-session"
+            )
+        )
+        self.assertEqual(attempt.status, "pending")
+
+        claimed = attempt_model.claim_from_callback(
+            state, self.env.cr.dbname, "initial-session"
+        )
+        self.assertEqual(claimed, attempt)
+        self.assertEqual(claimed.status, "claimed")
+        self.assertFalse(
+            attempt_model.claim_from_callback(
+                state, self.env.cr.dbname, "initial-session"
+            )
+        )
+
+    def test_native_shaped_state_cannot_bypass_an_oidc_attempt(self):
+        """Test that a native-shaped callback state cannot bypass OIDC correlation."""
+        state = json.dumps({"d": self.env.cr.dbname, "p": self.provider_rec.id})
+        with (
+            patch.object(self, "http_request_allow_all", True),
+            MockRequest(self.env) as mock_request,
+        ):
+            response = self._signin_controller_boundary(state=state)
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("?", response.location)
+
+    def test_non_ascii_state_fails_at_the_fixed_login_destination(self):
+        """Test malformed callback state never raises or remains in the URL."""
+        with MockRequest(self.env) as mock_request:
+            response = self._signin_controller_boundary(state="not-ascii-€")
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("?", response.location)
+
+    def test_native_failure_redirect_detection_preserves_success_locations(self):
+        """Test native error redirects alone are normalized after callback claim."""
+        failure = type("Response", (), {"location": "/web/login?oauth_error=3"})()
+        success = type("Response", (), {"location": "/odoo"})()
+        self.assertTrue(OpenIDController._is_native_failure_redirect(failure))
+        self.assertFalse(OpenIDController._is_native_failure_redirect(success))
+
+    def test_claim_without_a_session_database_does_not_open_an_environment(self):
+        """Test that callback correlation fails before accessing an environment."""
+
+        class RequestWithoutDatabase:
+            session = type("Session", (), {"db": False})()
+
+            @property
+            def env(self):
+                raise AssertionError("callback must not access request.env")
+
+        with patch(
+            "odoo.addons.auth_oidc.controllers.main.request",
+            RequestWithoutDatabase(),
+        ):
+            self.assertFalse(OpenIDController._claim_oidc_attempt("opaque-state"))
 
     def _prepare_login_test_user(self):
+        """Create and bind a user to the provider-scoped standard subject."""
         user = self.env["res.users"].create(
             {
                 "login": "auth_oidc_test_user",
                 "name": "Auth OIDC Test User",
             }
         )
-        user.write({"oauth_provider_id": self.provider_rec.id, "oauth_uid": user.login})
+        user.write(
+            {"oauth_provider_id": self.provider_rec.id, "oauth_uid": "test-subject"}
+        )
         return user
 
+    def _claimed_attempt(self):
+        """Create and claim one attempt for direct token-boundary tests."""
+        attempt, state = self.env["auth.oidc.login.attempt"].create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "token-test-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        return self.env["auth.oidc.login.attempt"].claim_from_callback(
+            state, self.env.cr.dbname, "token-test-session"
+        )
+
+    def _pending_callback_attempt(self):
+        """Create one pending attempt bound to the MockRequest browser session."""
+        return self.env["auth.oidc.login.attempt"].create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "auth-oidc-test-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id, "r": "/odoo"},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+
+    def test_login_context_is_immutable_and_contains_only_safe_identifiers(self):
+        """Test the downstream context excludes every attempt secret and record."""
+        attempt, _state = self._pending_callback_attempt()
+        attempt.website_id = 42
+        login_context = VerifiedOIDCLoginContext.from_attempt(attempt)
+        self.assertEqual(login_context.attempt_id, attempt.id)
+        self.assertEqual(login_context.website_id, 42)
+        self.assertEqual(
+            set(login_context.__dataclass_fields__), {"attempt_id", "website_id"}
+        )
+        for forbidden in (
+            "attempt",
+            "database_name",
+            "session_fingerprint",
+            "callback_uri",
+            "nonce",
+            "code_verifier",
+            "access_token",
+            "claims",
+        ):
+            self.assertFalse(hasattr(login_context, forbidden))
+        with self.assertRaises(FrozenInstanceError):
+            login_context.website_id = 7
+
+    def test_login_context_normalizes_missing_website_to_none(self):
+        """Test a missing initiating website has one explicit representation."""
+        attempt, _state = self._pending_callback_attempt()
+        self.assertIsNone(VerifiedOIDCLoginContext.from_attempt(attempt).website_id)
+
+    @responses.activate
+    def test_policy_hook_receives_login_context_and_sanitized_native_params(self):
+        """Test the four-argument hook receives only explicit trusted values."""
+        user = self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        attempt.website_id = 42
+        self._prepare_login_test_responses(attempt)
+        with patch.object(
+            ResUsers, "_auth_oidc_signin", autospec=True, return_value=user.login
+        ) as signin_hook:
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        _users, provider, _principal, login_context, native_params = (
+            signin_hook.call_args.args
+        )
+        self.assertEqual(provider, self.provider_rec.id)
+        self.assertEqual(login_context, VerifiedOIDCLoginContext(attempt.id, 42))
+        self.assertEqual(set(native_params), {"access_token", "state"})
+        self.assertNotIn("code-sentinel", native_params.values())
+
     def _prepare_login_test_responses(
-        self, access_token="42", id_token_body=None, id_token_headers=None, keys=None
+        self,
+        attempt,
+        claims=None,
+        access_token="42",
+        headers=None,
+        signing_key=None,
+        algorithm="RS256",
+        jwks=None,
+        token_status=200,
+        include_access_token=True,
+        include_id_token=True,
     ):
-        if id_token_body is None:
-            id_token_body = {}
-        if id_token_headers is None:
-            id_token_headers = {"kid": "the_key_id"}
+        """Mock one token/JWKS exchange with a complete signed ID token."""
+        now = int(time.time())
+        payload = {
+            "sub": "test-subject",
+            "iss": self.provider_rec.issuer,
+            "aud": self.provider_rec.client_id,
+            "exp": now + 300,
+            "nbf": now - 1,
+            "iat": now,
+            "nonce": attempt.nonce,
+        }
+        payload.update(claims or {})
+        if token_status != 200:
+            responses.add(
+                responses.POST,
+                "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
+                status=token_status,
+            )
+            return
         responses.add(
             responses.POST,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/token",
             json={
-                "access_token": access_token,
-                "id_token": jwt.encode(
-                    id_token_body,
-                    self.rsa_key_pem,
-                    algorithm="RS256",
-                    headers=id_token_headers,
+                **({"access_token": access_token} if include_access_token else {}),
+                **(
+                    {
+                        "id_token": jwt.encode(
+                            payload,
+                            signing_key or self.rsa_key_pem,
+                            algorithm=algorithm,
+                            headers=(
+                                headers
+                                if headers is not None
+                                else {"kid": "the_key_id"}
+                            ),
+                        )
+                    }
+                    if include_id_token
+                    else {}
                 ),
             },
         )
-        if keys is None:
-            if "kid" in id_token_headers:
-                keys = [{"kid": "the_key_id", "keys": [self.rsa_key_public_pem]}]
-            else:
-                keys = [{"keys": [self.rsa_key_public_pem]}]
+        jwk = dict(self.rsa_key_public_jwk, kid="the_key_id")
         responses.add(
             responses.GET,
             "http://localhost:8080/auth/realms/master/protocol/openid-connect/certs",
-            json={"keys": keys},
+            json={"keys": jwks if jwks is not None else [jwk]},
         )
 
     @responses.activate
-    def test_login(self):
-        """Test that login works"""
+    def test_login_uses_verified_subject_and_attempt_credentials(self):
+        """Test that native OAuth receives only a verified standard subject."""
         user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(id_token_body={"user_id": user.login})
-
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                params,
-            )
-        self.assertEqual(token, "42")
+        attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(attempt, access_token="access-sentinel")
+        db, login, token = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+        )
+        self.assertEqual(db, self.env.cr.dbname)
+        self.assertEqual(token, "access-sentinel")
         self.assertEqual(login, user.login)
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "consumed")
 
     @responses.activate
-    def test_login_without_kid(self):
-        """Test that login works when ID Token has no kid in header"""
+    def test_finalizer_receives_exact_user_before_attempt_consumption(self):
+        """Test the downstream finalizer receives the verified principal once."""
         user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token=chr(42),
-        )
+        attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(attempt)
 
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
+        def finalizer(_users, provider, principal, login_context, final_user):
+            attempt.invalidate_recordset(["status"])
+            self.assertEqual(attempt.status, "claimed")
+            self.assertEqual(provider, self.provider_rec)
+            self.assertEqual(principal.subject, "test-subject")
+            self.assertEqual(login_context.attempt_id, attempt.id)
+            self.assertEqual(final_user, user)
+
+        with patch.object(
+            ResUsers,
+            "_auth_oidc_finalize_user_provisioning",
+            autospec=True,
+            side_effect=finalizer,
+        ) as finalizer_hook:
+            _database, login, _token = self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                params,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
             )
-        self.assertEqual(token, "*")
+
         self.assertEqual(login, user.login)
+        finalizer_hook.assert_called_once()
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "consumed")
 
     @responses.activate
-    def test_login_with_sub_claim(self):
-        """Test that login works when ID Token contains only standard claims"""
-        self.provider_rec.token_map = False
+    def test_finalizer_failure_rolls_back_native_signin_and_callback(self):
+        """Test a finalizer failure rolls back credential writes and reaches login."""
         user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"sub": user.login}, access_token="1764"
-        )
+        user.sudo().oauth_access_token = "previous-token"
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt, access_token="new-token")
 
-        params = {"state": json.dumps({})}
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
-                self.provider_rec.id,
-                params,
-            )
-        self.assertEqual(token, "1764")
-        self.assertEqual(login, user.login)
-
-    @responses.activate
-    def test_login_without_kid_multiple_keys_in_jwks(self):
-        """
-        Test that login fails if no kid is provided in ID Token and JWKS has multiple
-        keys
-        """
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="6*7",
-            keys=[
-                {"kid": "other_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
-        )
-
-        with self.assertRaises(
-            JWTError,
-            msg="OpenID Connect requires kid to be set if there is"
-            " more than one key in the JWKS",
+        with (
+            MockRequest(self.env) as mock_request,
+            patch.object(
+                ResUsers,
+                "_auth_oidc_finalize_user_provisioning",
+                autospec=True,
+                side_effect=OIDCAuthenticationError("finalizer_failed"),
+            ),
         ):
-            with MockRequest(self.env):
-                self.env["res.users"].auth_oauth(
-                    self.provider_rec.id,
-                    {"state": json.dumps({})},
-                )
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+
+        user.sudo().invalidate_recordset(["oauth_access_token"])
+        self.assertEqual(user.sudo().oauth_access_token, "previous-token")
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
 
     @responses.activate
-    def test_login_without_matching_key(self):
-        """Test that login fails if no matching key can be found"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="168/4",
-            keys=[{"kid": "other_key_id", "keys": [self.second_key_public_pem]}],
-        )
+    def test_finalizer_requires_matching_exact_identity_login(self):
+        """Test a callback cannot finalize a different user login."""
+        self._prepare_login_test_user()
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt)
 
-        with self.assertRaises(JWTError):
-            with MockRequest(self.env):
-                self.env["res.users"].auth_oauth(
-                    self.provider_rec.id,
-                    {"state": json.dumps({})},
-                )
+        with (
+            MockRequest(self.env) as mock_request,
+            patch.object(
+                ResUsers,
+                "_auth_oidc_signin",
+                autospec=True,
+                return_value="different-login",
+            ),
+            patch.object(
+                ResUsers, "_auth_oidc_finalize_user_provisioning", autospec=True
+            ) as finalizer_hook,
+        ):
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+
+        finalizer_hook.assert_not_called()
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+
+    def test_claimed_provider_denial_is_normalized_after_native_handling(self):
+        """Test provider denial reaches native OAuth then returns fixed login."""
+        attempt, state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            response = self._signin_controller_boundary(
+                state=state, error="provider-error-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("provider-error-sentinel", response.location)
+        self.assertNotIn("oauth_error", response.location)
 
     @responses.activate
-    def test_login_without_any_key(self):
-        """Test that login fails if no key is provided by JWKS"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            id_token_headers={},
-            access_token="168/4",
-            keys=[],
+    def test_claimed_exchange_failure_is_normalized_after_native_handling(self):
+        """Test token exchange failure reaches native OAuth then uses fixed login."""
+        attempt, state = self._pending_callback_attempt()
+        self._prepare_login_test_responses(attempt, token_status=500)
+        with MockRequest(self.env) as mock_request:
+            response = self._signin_controller_boundary(
+                state=state, code="code-sentinel"
+            )
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertNotIn("code-sentinel", response.location)
+
+    def test_native_callback_failure_is_rewritten_and_success_is_preserved(self):
+        """Test only a native OAuth error redirect is replaced after attempt claim."""
+        failing_attempt, failing_state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            native_failure = mock_request.redirect("/web/login?oauth_error=2", 303)
+            with patch.object(OAuthController, "signin", return_value=native_failure):
+                response = self._signin_controller_boundary(state=failing_state)
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.location, "/web/login")
+
+        success_attempt, success_state = self._pending_callback_attempt()
+        with MockRequest(self.env) as mock_request:
+            native_success = mock_request.redirect("/odoo", 303)
+            with patch.object(OAuthController, "signin", return_value=native_success):
+                response = self._signin_controller_boundary(state=success_state)
+            self.assertNotIn("auth_oidc_error", mock_request.session)
+        self.assertEqual(response.location, "/odoo")
+
+    @responses.activate
+    def test_strict_claim_failures_mark_the_attempt_failed(self):
+        """Test each claim contract failure denies before native sign-in."""
+        now = int(time.time())
+        self.provider_rec.tenant_id = "tenant-sentinel"
+        failures = {
+            "issuer": {"iss": "wrong-issuer"},
+            "audience": {"aud": "wrong-audience"},
+            "exp": {"exp": None},
+            "nbf": {"nbf": None},
+            "iat": {"iat": None},
+            "nonce": {"nonce": "wrong-nonce"},
+            "missing_tenant": {"tid": None},
+            "tenant": {"tid": "wrong-tenant"},
+            "subject": {"sub": ""},
+            "multi_audience_azp": {"aud": [self.provider_rec.client_id, "other"]},
+            "expired": {"exp": now - 1000},
+            "future_nbf": {"nbf": now + 1000},
+            "future_iat": {"iat": now + 1000},
+        }
+        for name, claims in failures.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, claims=claims)
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @staticmethod
+    def _at_hash(access_token):
+        """Return the OpenID Connect RS256 access-token hash for a test token."""
+        digest = hashlib.sha256(access_token.encode()).digest()
+        return (
+            base64.urlsafe_b64encode(digest[: len(digest) // 2]).rstrip(b"=").decode()
         )
 
+    @responses.activate
+    def test_access_token_hash_is_validated(self):
+        """Test a matching at_hash is accepted and a mismatching hash is terminal."""
+        user = self._prepare_login_test_user()
+        access_token = "access-token-sentinel"
+        valid_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(
+            valid_attempt,
+            access_token=access_token,
+            claims={"at_hash": self._at_hash(access_token)},
+        )
+        _, login, _ = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": valid_attempt.id, "code": "code-sentinel"},
+        )
+        self.assertEqual(login, user.login)
+        responses.reset()
+
+        invalid_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(
+            invalid_attempt,
+            access_token=access_token,
+            claims={"at_hash": "wrong-hash"},
+        )
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": invalid_attempt.id, "code": "code-sentinel"},
+        )
+        invalid_attempt.invalidate_recordset(["status"])
+        self.assertEqual(invalid_attempt.status, "failed")
+
+    @responses.activate
+    def test_missing_token_values_mark_attempt_failed(self):
+        """Test the token response must contain both required token values."""
+        for name, kwargs in {
+            "access_token": {"include_access_token": False},
+            "id_token": {"include_id_token": False},
+        }.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, **kwargs)
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @responses.activate
+    def test_key_algorithm_and_signature_failures_mark_attempt_failed(self):
+        """Test key selection, allowlist, and signature failures are terminal."""
+        failures = {
+            "missing_key": {"headers": {"kid": "missing-key"}},
+            "missing_key_id": {"headers": {}},
+            "algorithm": {"algorithm": "HS256", "signing_key": "shared-secret"},
+            "signature": {"signing_key": self.second_key_pem},
+        }
+        for name, kwargs in failures.items():
+            with self.subTest(name=name):
+                attempt = self._claimed_attempt()
+                self._prepare_login_test_responses(attempt, **kwargs)
+                self._auth_oauth_denied(
+                    self.provider_rec.id,
+                    {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+                )
+                attempt.invalidate_recordset(["status"])
+                self.assertEqual(attempt.status, "failed")
+                responses.reset()
+
+    @responses.activate
+    def test_jwks_rotation_tries_matching_keys_until_signature_validates(self):
+        """Test same-key-ID rotation accepts a later valid JWKS key."""
+        user = self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        old_jwk = dict(self.second_key_public_jwk, kid="the_key_id")
+        current_jwk = dict(self.rsa_key_public_jwk, kid="the_key_id")
+        self._prepare_login_test_responses(attempt, jwks=[old_jwk, current_jwk])
+        _, login, _ = self.env["res.users"].auth_oauth(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+        )
+        self.assertEqual(login, user.login)
+
+    def test_wrong_attempt_provider_is_rejected_before_exchange(self):
+        """Test a claimed attempt cannot be used with a different provider."""
+        attempt = self._claimed_attempt()
+        other_provider = self.env["auth.oauth.provider"].create(
+            {
+                "name": "Other OpenID Connect Provider",
+                "flow": "id_token_code",
+                "enabled": False,
+                "client_id": "other-client",
+                "auth_endpoint": "https://example.invalid/authorize",
+                "body": "Other OpenID Connect Provider",
+            }
+        )
+        attempt.write({"provider_id": other_provider.id})
         with self.assertRaises(AccessDenied):
-            with MockRequest(self.env):
-                with self.assertLogs(level=logging.ERROR) as logs:
-                    self.env["res.users"].auth_oauth(
-                        self.provider_rec.id,
-                        {"state": json.dumps({})},
-                    )
-        self.assertEqual(len(logs.records), 1)
-        self.assertEqual(logs.records[0].levelno, logging.ERROR)
-        self.assertEqual(
-            "ERROR:odoo.addons.auth_oidc.models.res_users:user_id claim not found in"
-            " id_token (after mapping).",
-            logs.output[0],
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": attempt.id + 1000000,
+                    "code": "code-sentinel",
+                },
+            )
+
+    def test_legacy_or_unknown_provider_never_falls_back_to_native_validation(self):
+        """Test injected legacy and unknown flows deny before native OAuth."""
+        self.env.cr.execute(
+            "UPDATE auth_oauth_provider SET flow = 'id_token' WHERE id = %s",
+            [self.provider_rec.id],
         )
+        self.provider_rec.invalidate_recordset(["flow"])
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(self.provider_rec.id, {})
+        with self.assertRaises(AccessDenied):
+            self.env["res.users"].auth_oauth(self.provider_rec.id + 1000000, {})
+
+    def test_provider_configuration_and_clock_skew_are_constrained(self):
+        """Test enabled OIDC configuration and clock skew fail at the ORM boundary."""
+        with self.assertRaises(ValidationError):
+            self.provider_rec.write({"clock_skew_seconds": 301})
+        with self.assertRaises(ValidationError):
+            self.provider_rec.write({"allowed_algorithms": "HS256"})
+        with self.assertRaises(ValidationError):
+            self.env["auth.oauth.provider"].create(
+                {
+                    "name": "Incomplete OpenID Connect Provider",
+                    "flow": "id_token_code",
+                    "enabled": True,
+                    "auth_endpoint": "https://example.invalid/authorize",
+                    "body": "Incomplete OpenID Connect Provider",
+                }
+            )
+
+    def test_expected_failure_log_redacts_callback_sentinels(self):
+        """Test typed protocol failures do not log callback or provider text."""
+        attempt = self._claimed_attempt()
+        with (
+            self.assertRaises(AccessDenied),
+            self.assertLogs(
+                "odoo.addons.auth_oidc.models.res_users", level=logging.INFO
+            ) as logs,
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider_rec.id,
+                {
+                    "_auth_oidc_attempt_id": attempt.id,
+                    "error": "error-sentinel",
+                    "code": "code-sentinel",
+                },
+            )
+        output = "\n".join(logs.output)
+        for sentinel in ("error-sentinel", "code-sentinel", attempt.nonce):
+            self.assertNotIn(sentinel, output)
+
+    def test_failure_notification_is_frozen_and_contains_no_secret_fields(self):
+        """Test the notification shape contains only reason and attempt correlation."""
+        failure = OIDCFailure(reason="credential_rejected", attempt_id=42)
+        self.assertEqual(set(failure.__dataclass_fields__), {"reason", "attempt_id"})
+        for forbidden in (
+            "message",
+            "description",
+            "response",
+            "body",
+            "code",
+            "token",
+            "nonce",
+            "claims",
+        ):
+            self.assertFalse(hasattr(failure, forbidden))
+        with self.assertRaises(FrozenInstanceError):
+            failure.reason = "changed"
 
     @responses.activate
-    def test_login_with_multiple_keys_in_jwks(self):
-        """Test that login works with multiple keys present in jwks"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            access_token="2*3*7",
-            keys=[
-                {"kid": "other_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
+    def test_invalid_client_is_classified_and_notifies_once(self):
+        """Test exact token JSON invalid_client becomes one credential notification."""
+        attempt = self._claimed_attempt()
+        responses.add(
+            responses.POST,
+            self.provider_rec.token_endpoint,
+            status=401,
+            json={
+                "error": "invalid_client",
+                "error_description": "secret-description-sentinel",
+            },
         )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
+        with (
+            patch.object(ResUsers, "_auth_oidc_failure", autospec=True) as failure_hook,
+            self.assertRaises(AccessDenied),
+        ):
+            self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
             )
-        self.assertEqual(token, "2*3*7")
-        self.assertEqual(login, user.login)
+        failure_hook.assert_called_once()
+        _users, provider, failure = failure_hook.call_args.args
+        self.assertEqual(provider, self.provider_rec.id)
+        self.assertEqual(failure, OIDCFailure("credential_rejected", attempt.id))
 
     @responses.activate
-    def test_login_with_multiple_keys_in_jwks_same_kid(self):
-        """Test that login works with multiple keys with the same kid present in jwks"""
-        user = self._prepare_login_test_user()
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            access_token="84/2",
-            keys=[
-                {"kid": "the_key_id", "keys": [self.second_key_public_pem]},
-                {"kid": "the_key_id", "keys": [self.rsa_key_public_pem]},
-            ],
+    def test_other_token_error_keeps_generic_exchange_classification(self):
+        """Test provider errors other than exact invalid_client stay generic."""
+        attempt = self._claimed_attempt()
+        responses.add(
+            responses.POST,
+            self.provider_rec.token_endpoint,
+            status=400,
+            json={"error": "invalid_grant", "error_description": "secret-sentinel"},
         )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
+        with (
+            patch.object(ResUsers, "_auth_oidc_failure", autospec=True) as failure_hook,
+            self.assertRaises(AccessDenied),
+        ):
+            self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
             )
-        self.assertEqual(token, "84/2")
-        self.assertEqual(login, user.login)
+        failure = failure_hook.call_args.args[-1]
+        self.assertEqual(failure.reason, "token_exchange_failed")
 
     @responses.activate
-    def test_login_with_jwk_format(self):
-        """Test that login works with proper jwks format"""
-        user = self._prepare_login_test_user()
-        self.rsa_key_public_jwk["kid"] = "the_key_id"
-        self._prepare_login_test_responses(
-            id_token_body={"user_id": user.login},
-            keys=[self.rsa_key_public_jwk],
-            access_token="122/3",
-        )
-
-        with MockRequest(self.env):
-            db, login, token = self.env["res.users"].auth_oauth(
+    def test_failure_hook_exception_preserves_access_denied(self):
+        """Test an extension-hook exception cannot replace generic auth failure."""
+        attempt = self._claimed_attempt()
+        with (
+            patch.object(
+                ResUsers,
+                "_auth_oidc_failure",
+                autospec=True,
+                side_effect=RuntimeError("hook-secret-sentinel"),
+            ),
+            self.assertRaises(AccessDenied),
+            self.assertLogs(
+                "odoo.addons.auth_oidc.models.res_users", level=logging.ERROR
+            ) as logs,
+        ):
+            self.env["res.users"].auth_oauth(
                 self.provider_rec.id,
-                {"state": json.dumps({})},
+                {
+                    "_auth_oidc_attempt_id": attempt.id,
+                    "error": "provider-error-sentinel",
+                },
             )
-        self.assertEqual(token, "122/3")
-        self.assertEqual(login, user.login)
+        self.assertNotIn("hook-secret-sentinel", "\n".join(logs.output))
+
+    @responses.activate
+    def test_provider_denial_and_exchange_failure_mark_attempt_failed(self):
+        """Test provider and token-endpoint errors are terminal and redacted."""
+        denied_attempt = self._claimed_attempt()
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {
+                "_auth_oidc_attempt_id": denied_attempt.id,
+                "error": "provider-error-sentinel",
+            },
+        )
+        denied_attempt.invalidate_recordset(["status"])
+        self.assertEqual(denied_attempt.status, "failed")
+
+        exchange_attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(exchange_attempt, token_status=500)
+        self._auth_oauth_denied(
+            self.provider_rec.id,
+            {"_auth_oidc_attempt_id": exchange_attempt.id, "code": "code-sentinel"},
+        )
+        exchange_attempt.invalidate_recordset(["status"])
+        self.assertEqual(exchange_attempt.status, "failed")
