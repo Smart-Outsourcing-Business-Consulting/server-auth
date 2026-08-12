@@ -1,6 +1,19 @@
-## 19.0.1.0.0 2025-10-01
+## 19.0.1.4.0 2026-08-12
 
-- Odoo 19 migration
+- Port the hardened authorization-code lifecycle to Odoo 19.
+- Preserve Odoo's native post-login redirect state and remove the redundant
+  attempt redirect field.
+- Replace legacy SQL constraints and removed controller/registry APIs.
+
+## 18.0.1.4.0 2026-08-10
+
+- Preserve Odoo's native post-login redirect state and remove the redundant
+  attempt redirect field.
+
+## 18.0.1.3.0 2026-08-10
+
+- Harden authorization-code login and remove implicit-flow documentation and
+  test configuration.
 
 ## 18.0.1.0.0 2024-10-09
 
