@@ -11,6 +11,8 @@ from datetime import timedelta
 from odoo import api, fields, models
 from odoo.exceptions import AccessDenied
 
+PENDING_ATTEMPT_LIMIT = 1000
+
 
 class AuthOIDCLoginAttempt(models.Model):
     """Persist the browser-bound material for one OIDC code-flow login."""
@@ -63,7 +65,7 @@ class AuthOIDCLoginAttempt(models.Model):
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
     @api.model
-    def create_for_authorization(
+    def _create_for_authorization(
         self,
         provider,
         database_name,
@@ -72,16 +74,45 @@ class AuthOIDCLoginAttempt(models.Model):
         website_id,
         callback_uri,
     ):
-        """Create one browser-bound attempt and return its public state value."""
+        """Create one browser-bound attempt within the fixed storage bound."""
+        provider.ensure_one()
+        attempt_model = self.sudo()
+        session_fingerprint = self._session_fingerprint(session_id)
+        website_id = website_id or False
+        now = fields.Datetime.now()
+
+        self.env.cr.execute(
+            "SELECT id FROM auth_oauth_provider WHERE id = %s FOR UPDATE",
+            (provider.id,),
+        )
+        if not self.env.cr.fetchone():
+            raise AccessDenied(self.env._("The OIDC provider is unavailable."))
+
+        pending_domain = [
+            ("provider_id", "=", provider.id),
+            ("database_name", "=", database_name),
+            ("website_id", "=", website_id),
+            ("status", "=", "pending"),
+        ]
+        attempt_model.search(pending_domain + [("expires_at", "<", now)]).unlink()
+        attempt_model.search(
+            pending_domain + [("session_fingerprint", "=", session_fingerprint)]
+        ).unlink()
+        if (
+            attempt_model.search_count(pending_domain + [("expires_at", ">=", now)])
+            >= PENDING_ATTEMPT_LIMIT
+        ):
+            raise AccessDenied(self.env._("OIDC login is temporarily unavailable."))
+
         state = secrets.token_urlsafe(32)
         nonce = secrets.token_urlsafe(32)
         code_verifier = secrets.token_urlsafe(64)
-        expires_at = fields.Datetime.now() + timedelta(minutes=10)
-        attempt = self.sudo().create(
+        expires_at = now + timedelta(minutes=10)
+        attempt = attempt_model.create(
             {
                 "provider_id": provider.id,
                 "database_name": database_name,
-                "session_fingerprint": self._session_fingerprint(session_id),
+                "session_fingerprint": session_fingerprint,
                 "state_digest": self._state_digest(state),
                 "native_state": native_state,
                 "website_id": website_id,
@@ -161,10 +192,17 @@ class AuthOIDCLoginAttempt(models.Model):
     @api.model
     def _cron_cleanup_expired_attempts(self):
         """Delete terminal and expired attempts after the fixed retention window."""
-        cutoff = fields.Datetime.now() - timedelta(hours=24)
+        now = fields.Datetime.now()
+        cutoff = now - timedelta(hours=24)
         stale_attempts = self.sudo().search(
             [
                 "|",
+                "|",
+                "&",
+                ("status", "=", "pending"),
+                ("expires_at", "<", now),
+                "&",
+                ("status", "=", "claimed"),
                 ("expires_at", "<", cutoff),
                 "&",
                 ("status", "in", ("consumed", "failed")),
