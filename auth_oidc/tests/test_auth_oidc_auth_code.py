@@ -8,6 +8,7 @@ import json
 import logging
 import time
 from dataclasses import FrozenInstanceError
+from datetime import timedelta
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote_plus, urlparse
 
@@ -24,7 +25,12 @@ from odoo.tests import common
 from odoo.addons.auth_oauth.controllers.main import OAuthController
 from odoo.addons.website.tools import MockRequest as _MockRequest
 
-from ..controllers.main import OpenIDController, OpenIDLogin
+from ..controllers.main import (
+    MAX_STAGED_START_INTENTS,
+    START_STATE_SESSION_KEY,
+    OpenIDController,
+    OpenIDLogin,
+)
 from ..models.auth_oauth_provider import OIDCAuthenticationError
 from ..models.res_users import OIDCFailure, ResUsers, VerifiedOIDCLoginContext
 
@@ -102,82 +108,176 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         """Call the controller endpoint without the unrouted HTTP wrapper."""
         return OpenIDController.signin.original_endpoint(OpenIDController(), **params)
 
-    def test_auth_link(self):
-        """Test that the authentication link is correct."""
+    @staticmethod
+    def _start_controller_boundary(**params):
+        """Call the OIDC initiation endpoint without the routed HTTP wrapper."""
+        return OpenIDController.start.original_endpoint(OpenIDController(), **params)
+
+    def test_login_render_stages_local_start_without_attempt(self):
+        """Test rendering creates no attempt or secret-bearing local query."""
         # disable existing providers except our test provider
         self.env["auth.oauth.provider"].search(
             [("client_id", "!=", "auth_oidc-test")]
         ).write(dict(enabled=False))
-        with MockRequest(self.env):
+        attempt_model = self.env["auth.oidc.login.attempt"]
+        with MockRequest(self.env) as mock_request:
+            mock_request.params = {
+                "redirect": "/web#home",
+                "token": "invitation-token-sentinel",
+            }
             providers = OpenIDLogin().list_providers()
             self.assertEqual(len(providers), 1)
             auth_link = providers[0]["auth_link"]
-            assert auth_link.startswith(self.provider_rec.auth_endpoint)
-            params = parse_qs(urlparse(auth_link).query)
-            self.assertEqual(params["client_id"], [self.provider_rec.client_id])
-            state = params["state"][0]
-            attempt = self.env["auth.oidc.login.attempt"].search(
-                [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
-            )
-            self.assertEqual(attempt.provider_id, self.provider_rec)
-            self.assertEqual(attempt.database_name, self.env.cr.dbname)
-            self.assertEqual(attempt.status, "pending")
-            self.assertEqual(unquote_plus(attempt.native_state["r"]), BASE_URL + "/web")
-            self.assertEqual(attempt.callback_uri, BASE_URL + "/auth_oauth/signin")
-            self.assertEqual(
-                {
-                    key: params[key]
-                    for key in {
-                        "response_type",
-                        "redirect_uri",
-                        "state",
-                        "nonce",
-                        "code_challenge",
-                        "code_challenge_method",
-                        "scope",
-                    }
-                },
-                {
-                    "response_type": ["code"],
-                    "redirect_uri": [BASE_URL + "/auth_oauth/signin"],
-                    "state": [state],
-                    "nonce": [attempt.nonce],
-                    "code_challenge": [attempt.code_challenge()],
-                    "code_challenge_method": ["S256"],
-                    "scope": ["openid email"],
-                },
-            )
+        parsed = urlparse(auth_link)
+        self.assertEqual(parsed.path, "/auth_oidc/start")
+        start_query = parse_qs(parsed.query)
+        self.assertEqual(set(start_query), {"intent"})
+        self.assertGreaterEqual(len(start_query["intent"][0]), 32)
+        self.assertNotIn("invitation-token-sentinel", auth_link)
+        self.assertEqual(attempt_model.search_count([]), 0)
 
-    def test_authorization_attempts_are_fresh_and_preserve_native_state(self):
-        """Test that each authorization URL binds fresh native OAuth state."""
+    def test_login_render_bounds_staged_start_intents(self):
+        """Test repeated anonymous rendering cannot grow session intent state."""
         self.env["auth.oauth.provider"].search(
             [("client_id", "!=", "auth_oidc-test")]
         ).write({"enabled": False})
         with MockRequest(self.env) as mock_request:
-            mock_request.params = {"redirect": "/web#home"}
-            first_url = OpenIDLogin().list_providers()[0]["auth_link"]
-            second_url = OpenIDLogin().list_providers()[0]["auth_link"]
+            for index in range(MAX_STAGED_START_INTENTS + 5):
+                mock_request.params = {"redirect": f"/web#{index}"}
+                OpenIDLogin().list_providers()
+            self.assertEqual(
+                len(mock_request.session[START_STATE_SESSION_KEY]),
+                MAX_STAGED_START_INTENTS,
+            )
+        self.assertFalse(self.env["auth.oidc.login.attempt"].search([]))
 
-        first_params = parse_qs(urlparse(first_url).query)
-        second_params = parse_qs(urlparse(second_url).query)
-        self.assertNotEqual(first_params["state"], second_params["state"])
-        self.assertNotEqual(first_params["nonce"], second_params["nonce"])
-        self.assertNotEqual(
-            first_params["code_challenge"], second_params["code_challenge"]
+    def test_start_creates_attempt_and_redirects_to_provider(self):
+        """Test a staged click creates one complete authorization attempt."""
+        self.env["auth.oauth.provider"].search(
+            [("client_id", "!=", "auth_oidc-test")]
+        ).write({"enabled": False})
+        with MockRequest(self.env) as mock_request:
+            mock_request.params = {
+                "redirect": "/web#home",
+                "token": "invitation-token-sentinel",
+            }
+            auth_link = OpenIDLogin().list_providers()[0]["auth_link"]
+            start_query = parse_qs(urlparse(auth_link).query)
+            response = self._start_controller_boundary(intent=start_query["intent"][0])
+            replay_response = self._start_controller_boundary(
+                intent=start_query["intent"][0]
+            )
+
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(response.location.startswith(self.provider_rec.auth_endpoint))
+        self.assertEqual(replay_response.status_code, 303)
+        self.assertEqual(replay_response.location, "/web/login")
+        params = parse_qs(urlparse(response.location).query)
+        self.assertEqual(params["client_id"], [self.provider_rec.client_id])
+        state = params["state"][0]
+        attempt = self.env["auth.oidc.login.attempt"].search(
+            [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
         )
+        self.assertEqual(attempt.provider_id, self.provider_rec)
+        self.assertEqual(attempt.database_name, self.env.cr.dbname)
+        self.assertEqual(attempt.status, "pending")
+        self.assertEqual(
+            unquote_plus(attempt.native_state["r"]), BASE_URL + "/web#home"
+        )
+        self.assertEqual(attempt.native_state["t"], "invitation-token-sentinel")
+        self.assertEqual(attempt.callback_uri, BASE_URL + "/auth_oauth/signin")
+        self.assertEqual(
+            {
+                key: params[key]
+                for key in {
+                    "response_type",
+                    "redirect_uri",
+                    "state",
+                    "nonce",
+                    "code_challenge",
+                    "code_challenge_method",
+                    "scope",
+                }
+            },
+            {
+                "response_type": ["code"],
+                "redirect_uri": [BASE_URL + "/auth_oauth/signin"],
+                "state": [state],
+                "nonce": [attempt.nonce],
+                "code_challenge": [attempt.code_challenge()],
+                "code_challenge_method": ["S256"],
+                "scope": ["openid email"],
+            },
+        )
+
+    def test_repeated_start_supersedes_same_session_pending_attempt(self):
+        """Test one session/provider/website retains only its latest attempt."""
+        self.env["auth.oauth.provider"].search(
+            [("client_id", "!=", "auth_oidc-test")]
+        ).write({"enabled": False})
+        with MockRequest(self.env) as mock_request:
+            mock_request.params = {"redirect": "/web#first"}
+            first_link = OpenIDLogin().list_providers()[0]["auth_link"]
+            first_intent = parse_qs(urlparse(first_link).query)["intent"][0]
+            mock_request.params = {"redirect": "/web#second"}
+            second_link = OpenIDLogin().list_providers()[0]["auth_link"]
+            second_intent = parse_qs(urlparse(second_link).query)["intent"][0]
+            first_response = self._start_controller_boundary(intent=first_intent)
+            first_attempt = self.env["auth.oidc.login.attempt"].search(
+                [("provider_id", "=", self.provider_rec.id)]
+            )
+            self.assertEqual(
+                unquote_plus(first_attempt.native_state["r"]), BASE_URL + "/web#first"
+            )
+            second_response = self._start_controller_boundary(intent=second_intent)
+
+        first_state = parse_qs(urlparse(first_response.location).query)["state"][0]
+        second_state = parse_qs(urlparse(second_response.location).query)["state"][0]
+        self.assertNotEqual(first_state, second_state)
         attempts = self.env["auth.oidc.login.attempt"].search(
-            [("provider_id", "=", self.provider_rec.id)], order="id desc", limit=2
+            [("provider_id", "=", self.provider_rec.id)]
+        )
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(
+            attempts.state_digest, hashlib.sha256(second_state.encode()).hexdigest()
         )
         self.assertEqual(
-            [unquote_plus(attempt.native_state["r"]) for attempt in attempts],
-            [BASE_URL + "/web#home", BASE_URL + "/web#home"],
+            unquote_plus(attempts.native_state["r"]), BASE_URL + "/web#second"
         )
-        self.assertTrue(all(attempt.code_verifier for attempt in attempts))
+        self.assertFalse(
+            self.env["auth.oidc.login.attempt"].claim_from_callback(
+                first_state, self.env.cr.dbname, "auth-oidc-test-session"
+            )
+        )
+
+    def test_start_without_staged_intent_fails_without_attempt(self):
+        """Test direct initiation cannot mint an attempt for arbitrary input."""
+        with MockRequest(self.env) as mock_request:
+            response = self._start_controller_boundary(intent="not-staged")
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertFalse(self.env["auth.oidc.login.attempt"].search([]))
+
+    def test_start_rechecks_provider_after_intent_is_staged(self):
+        """Test a disabled provider cannot use an already-rendered start link."""
+        self.env["auth.oauth.provider"].search(
+            [("client_id", "!=", "auth_oidc-test")]
+        ).write({"enabled": False})
+        with MockRequest(self.env) as mock_request:
+            auth_link = OpenIDLogin().list_providers()[0]["auth_link"]
+            intent = parse_qs(urlparse(auth_link).query)["intent"][0]
+            self.provider_rec.enabled = False
+            response = self._start_controller_boundary(intent=intent)
+            self.assertTrue(mock_request.session["auth_oidc_error"])
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.location, "/web/login")
+        self.assertFalse(self.env["auth.oidc.login.attempt"].search([]))
 
     def test_attempt_claim_is_session_bound_and_one_time(self):
         """Test that only the initiating session can atomically claim state."""
         attempt_model = self.env["auth.oidc.login.attempt"]
-        attempt, state = attempt_model.create_for_authorization(
+        attempt, state = attempt_model._create_for_authorization(
             self.provider_rec,
             self.env.cr.dbname,
             "initial-session",
@@ -202,6 +302,124 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
                 state, self.env.cr.dbname, "initial-session"
             )
         )
+
+    def test_pending_attempt_capacity_is_bounded_per_provider_and_website(self):
+        """Test distinct sessions cannot grow one provider/site past its bound."""
+        attempt_model = self.env["auth.oidc.login.attempt"]
+        create_values = (
+            self.provider_rec,
+            self.env.cr.dbname,
+        )
+        with patch(
+            "odoo.addons.auth_oidc.models.auth_oidc_login_attempt."
+            "PENDING_ATTEMPT_LIMIT",
+            2,
+        ):
+            for session_id in ("capacity-session-1", "capacity-session-2"):
+                attempt_model._create_for_authorization(
+                    *create_values,
+                    session_id,
+                    {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+                    False,
+                    BASE_URL + "/auth_oauth/signin",
+                )
+            with self.assertRaises(AccessDenied):
+                attempt_model._create_for_authorization(
+                    *create_values,
+                    "capacity-session-3",
+                    {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+                    False,
+                    BASE_URL + "/auth_oauth/signin",
+                )
+            website_attempt, _state = attempt_model._create_for_authorization(
+                *create_values,
+                "capacity-session-3",
+                {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+                42,
+                BASE_URL + "/auth_oauth/signin",
+            )
+
+        self.assertEqual(
+            attempt_model.search_count(
+                [
+                    ("provider_id", "=", self.provider_rec.id),
+                    ("website_id", "=", False),
+                    ("status", "=", "pending"),
+                ]
+            ),
+            2,
+        )
+        self.assertEqual(website_attempt.website_id, 42)
+
+    def test_expired_pending_attempt_is_removed_before_capacity_check(self):
+        """Test an expired row neither remains stored nor blocks fresh login."""
+        attempt_model = self.env["auth.oidc.login.attempt"]
+        with patch(
+            "odoo.addons.auth_oidc.models.auth_oidc_login_attempt."
+            "PENDING_ATTEMPT_LIMIT",
+            1,
+        ):
+            expired, _state = attempt_model._create_for_authorization(
+                self.provider_rec,
+                self.env.cr.dbname,
+                "expired-capacity-session",
+                {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+                False,
+                BASE_URL + "/auth_oauth/signin",
+            )
+            expired.expires_at = odoo.fields.Datetime.now() - timedelta(seconds=1)
+            fresh, _state = attempt_model._create_for_authorization(
+                self.provider_rec,
+                self.env.cr.dbname,
+                "fresh-capacity-session",
+                {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+                False,
+                BASE_URL + "/auth_oauth/signin",
+            )
+
+        self.assertFalse(expired.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_cleanup_deletes_expired_pending_without_terminal_retention_delay(self):
+        """Test pending expiry and terminal diagnostic retention stay distinct."""
+        attempt_model = self.env["auth.oidc.login.attempt"]
+        expired, _state = attempt_model._create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "cron-expired-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        unexpired, _state = attempt_model._create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "cron-unexpired-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        recent_terminal, _state = attempt_model._create_for_authorization(
+            self.provider_rec,
+            self.env.cr.dbname,
+            "cron-terminal-session",
+            {"d": self.env.cr.dbname, "p": self.provider_rec.id},
+            False,
+            BASE_URL + "/auth_oauth/signin",
+        )
+        expired.expires_at = odoo.fields.Datetime.now() - timedelta(seconds=1)
+        recent_terminal.write(
+            {
+                "status": "failed",
+                "terminal_at": odoo.fields.Datetime.now(),
+            }
+        )
+
+        attempt_model._cron_cleanup_expired_attempts()
+
+        self.assertFalse(expired.exists())
+        self.assertTrue(unexpired.exists())
+        self.assertTrue(recent_terminal.exists())
 
     def test_native_shaped_state_cannot_bypass_an_oidc_attempt(self):
         """Test that a native-shaped callback state cannot bypass OIDC correlation."""
@@ -253,7 +471,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
 
     def _claimed_attempt(self):
         """Create and claim one attempt for direct token-boundary tests."""
-        attempt, state = self.env["auth.oidc.login.attempt"].create_for_authorization(
+        attempt, state = self.env["auth.oidc.login.attempt"]._create_for_authorization(
             self.provider_rec,
             self.env.cr.dbname,
             "token-test-session",
@@ -267,7 +485,7 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
 
     def _pending_callback_attempt(self):
         """Create one pending attempt bound to the MockRequest browser session."""
-        return self.env["auth.oidc.login.attempt"].create_for_authorization(
+        return self.env["auth.oidc.login.attempt"]._create_for_authorization(
             self.provider_rec,
             self.env.cr.dbname,
             "auth-oidc-test-session",

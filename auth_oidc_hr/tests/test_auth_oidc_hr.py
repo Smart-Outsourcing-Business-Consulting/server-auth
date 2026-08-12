@@ -331,7 +331,7 @@ class TestAuthOIDCHRAdapter(TransactionCase):
 
     @responses.activate
     def test_adapter_finalizes_employee_before_consuming_attempt(self):
-        attempt, state = self.env["auth.oidc.login.attempt"].create_for_authorization(
+        attempt, state = self.env["auth.oidc.login.attempt"]._create_for_authorization(
             self.provider,
             self.env.cr.dbname,
             "auth-oidc-hr-session",
@@ -367,7 +367,7 @@ class TestAuthOIDCHRAdapter(TransactionCase):
             [("provider_id", "=", self.provider.id)]
         ).unlink()
         self.user.oauth_access_token = "previous-token"
-        attempt, state = self.env["auth.oidc.login.attempt"].create_for_authorization(
+        attempt, state = self.env["auth.oidc.login.attempt"]._create_for_authorization(
             self.provider,
             self.env.cr.dbname,
             "auth-oidc-test-session",
