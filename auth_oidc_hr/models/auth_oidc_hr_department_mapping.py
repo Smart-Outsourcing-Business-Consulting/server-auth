@@ -51,12 +51,16 @@ class AuthOIDCHRDepartmentMapping(models.Model):
         """Reject values that cannot be resolved safely at OIDC login time."""
         for mapping in self:
             if not mapping.claim_value:
-                raise ValidationError("The OIDC department claim value is required.")
+                raise ValidationError(
+                    mapping.env._("The OIDC department claim value is required.")
+                )
             if (
                 not mapping.department_id.active
                 or mapping.department_id.company_id != mapping.company_id
             ):
                 raise ValidationError(
-                    "The mapped department must be active and belong to the "
-                    "mapping company."
+                    mapping.env._(
+                        "The mapped department must be active and belong to the "
+                        "mapping company."
+                    )
                 )

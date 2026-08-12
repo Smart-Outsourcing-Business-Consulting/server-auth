@@ -1,0 +1,2 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_auth_oidc_login_attempt_none,auth.oidc.login.attempt no direct access,model_auth_oidc_login_attempt,base.group_system,0,0,0,0

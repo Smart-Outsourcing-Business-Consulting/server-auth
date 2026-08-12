@@ -15,6 +15,7 @@
     "external_dependencies": {"python": ["python-jose"]},
     "depends": ["auth_oauth"],
     "data": [
+        "security/ir.model.access.csv",
         "views/auth_oauth_provider.xml",
         "data/auth_oauth_data.xml",
         "data/auth_oidc_login_attempt_data.xml",
