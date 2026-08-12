@@ -159,13 +159,22 @@ Usage
 =====
 
 On the login page, click the authentication provider you configured. The
-provider must use the authorization-code flow.
+provider must use the authorization-code flow. Rendering the page
+creates no persistent OIDC attempt; the adapter creates it only after
+the provider link is followed.
 
 The adapter creates a server-side attempt for the current browser
 session, provider, and database. It sends opaque state, a nonce, and an
 S256 PKCE challenge. The attempt expires after 10 minutes and can be
 claimed only once; the nonce and PKCE verifier are not placed in
 browser-visible state.
+
+A new start for the same session, provider, and website supersedes the
+previous pending attempt. Expired pending attempts are removed before
+new capacity is allocated, and the adapter retains at most 1,000
+unexpired pending attempts per provider and website. These bounds are
+enforced by the adapter and do not depend on an external CAPTCHA or
+reverse proxy.
 
 On callback, the adapter exchanges the code with the stored verifier and
 validates the token algorithm, signature, times, audience, authorized
@@ -196,6 +205,12 @@ verification.
 
 Changelog
 =========
+
+18.0.1.5.0 2026-08-12
+---------------------
+
+-  Create OIDC attempts only when a provider link is followed and bound
+   pending attempt storage per browser session, provider, and website.
 
 18.0.1.4.0 2026-08-10
 ---------------------
