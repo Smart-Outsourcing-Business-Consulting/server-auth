@@ -7,7 +7,7 @@ import responses
 from psycopg2 import IntegrityError
 
 from odoo.exceptions import AccessError, ValidationError
-from odoo.tests.common import TransactionCase
+from odoo.tests.common import TransactionCase, mute_logger
 
 from odoo.addons.auth_oidc.controllers.main import OpenIDController
 from odoo.addons.auth_oidc.models.auth_oauth_provider import OIDCAuthenticationError
@@ -99,7 +99,11 @@ class TestAuthOIDCHR(TransactionCase):
                     "department_id": self.department.id,
                 }
             )
-        with self.assertRaises(IntegrityError), self.env.cr.savepoint():
+        with (
+            mute_logger("odoo.sql_db"),
+            self.assertRaises(IntegrityError),
+            self.env.cr.savepoint(),
+        ):
             self.mapping.create(
                 {
                     "provider_id": self.provider.id,
@@ -272,7 +276,11 @@ class TestAuthOIDCHR(TransactionCase):
             "Duplicate employee", "duplicate-employee", "base.group_user"
         )
         self._finalize(user)
-        with self.assertRaises(IntegrityError), self.env.cr.savepoint():
+        with (
+            mute_logger("odoo.sql_db"),
+            self.assertRaises(IntegrityError),
+            self.env.cr.savepoint(),
+        ):
             self.env["hr.employee"].create(
                 {"name": user.name, "user_id": user.id, "company_id": self.company.id}
             )
