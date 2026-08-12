@@ -8,7 +8,7 @@ import hashlib
 import secrets
 from datetime import timedelta
 
-from odoo import _, api, fields, models
+from odoo import api, fields, models
 from odoo.exceptions import AccessDenied
 
 
@@ -59,7 +59,7 @@ class AuthOIDCLoginAttempt(models.Model):
     def _session_fingerprint(self, session_id):
         """Return a one-way fingerprint for an Odoo browser session ID."""
         if not session_id:
-            raise AccessDenied(_("An OIDC browser session is required."))
+            raise AccessDenied(self.env._("An OIDC browser session is required."))
         return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
 
     @api.model

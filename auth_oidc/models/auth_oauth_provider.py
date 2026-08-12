@@ -95,7 +95,9 @@ class AuthOauthProvider(models.Model):
                 continue
             if not 0 <= provider.clock_skew_seconds <= 300:
                 raise ValidationError(
-                    "OpenID Connect clock skew must be between 0 and 300 seconds."
+                    provider.env._(
+                        "OpenID Connect clock skew must be between 0 and 300 seconds."
+                    )
                 )
             if not provider.enabled:
                 continue
@@ -111,15 +113,19 @@ class AuthOauthProvider(models.Model):
                 or "openid" not in (provider.scope or "").split()
             ):
                 raise ValidationError(
-                    "Enabled OpenID Connect providers require client ID, OpenID scope, "
-                    "token URL, JWKS URL, and exact issuer."
+                    provider.env._(
+                        "Enabled OpenID Connect providers require client ID, OpenID "
+                        "scope, token URL, JWKS URL, and exact issuer."
+                    )
                 )
             try:
                 provider._allowed_algorithms()
             except OIDCAuthenticationError as error:
                 raise ValidationError(
-                    "Enabled OpenID Connect provider algorithm configuration "
-                    "is invalid."
+                    provider.env._(
+                        "Enabled OpenID Connect provider algorithm configuration is "
+                        "invalid."
+                    )
                 ) from error
 
     def _allowed_algorithms(self):
