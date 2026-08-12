@@ -1,3 +1,8 @@
+## 19.0.1.5.0 2026-08-12
+
+- Create OIDC attempts only when a provider link is followed and bound pending
+  attempt storage per browser session, provider, and website.
+
 ## 19.0.1.4.0 2026-08-12
 
 - Port the hardened authorization-code lifecycle to Odoo 19.

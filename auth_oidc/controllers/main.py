@@ -6,11 +6,13 @@
 """OpenID Connect authorization start and callback correlation."""
 
 import json
+import secrets
 from urllib.parse import parse_qs, urlsplit
 
-from werkzeug.urls import url_decode, url_encode
+from werkzeug.urls import url_encode
 
 from odoo import SUPERUSER_ID, api, http
+from odoo.exceptions import AccessDenied
 from odoo.http import fragment_to_query_string, request
 from odoo.modules.registry import Registry
 
@@ -20,45 +22,43 @@ from odoo.addons.auth_oauth.controllers.main import (
 )
 from odoo.addons.web.controllers.utils import ensure_db
 
+START_STATE_SESSION_KEY = "auth_oidc_start_states"
+MAX_STAGED_START_INTENTS = 16
+
 
 class OpenIDLogin(OAuthLogin):
-    """Build one authorization-code URL per OIDC browser login attempt."""
+    """Stage native state and render one local start link per OIDC provider."""
 
     def list_providers(self):
-        """Add opaque state, nonce, and S256 PKCE parameters to OIDC links."""
+        """Render OIDC links without creating persistent attempt records."""
         providers = super().list_providers()
+        previous_states = dict(request.session.get(START_STATE_SESSION_KEY) or {})
+        new_states = {}
         for provider in providers:
             if provider.get("flow") != "id_token_code":
                 continue
-            params = url_decode(provider["auth_link"].split("?", 1)[-1])
-            callback_uri = self._callback_uri()
             native_state = self.get_state(provider)
             native_state["d"] = request.session.db
             native_state["p"] = provider["id"]
-            attempt, state = request.env[
-                "auth.oidc.login.attempt"
-            ].create_for_authorization(
-                request.env["auth.oauth.provider"].sudo().browse(provider["id"]),
-                request.session.db,
-                request.session.sid,
-                native_state,
-                self._website_id(),
-                callback_uri,
+            intent = secrets.token_urlsafe(32)
+            while intent in previous_states or intent in new_states:
+                intent = secrets.token_urlsafe(32)
+            new_states[intent] = {
+                "native_state": native_state,
+                "website_id": self._website_id(),
+                "callback_uri": self._callback_uri(),
+            }
+            provider["auth_link"] = "/auth_oidc/start?{}".format(
+                url_encode({"intent": intent})
             )
-            for key, value in {
-                "response_type": "code",
-                "redirect_uri": callback_uri,
-                "state": state,
-                "nonce": attempt.nonce,
-                "code_challenge": attempt.code_challenge(),
-                "code_challenge_method": "S256",
-            }.items():
-                params[key] = value
-            if provider.get("scope"):
-                params["scope"] = provider["scope"]
-            provider["auth_link"] = "{}?{}".format(
-                provider["auth_endpoint"], url_encode(params)
-            )
+        retained_count = max(MAX_STAGED_START_INTENTS - len(new_states), 0)
+        start_states = (
+            dict(list(previous_states.items())[-retained_count:])
+            if retained_count
+            else {}
+        )
+        start_states.update(new_states)
+        request.session[START_STATE_SESSION_KEY] = start_states
         return providers
 
     @staticmethod
@@ -75,6 +75,88 @@ class OpenIDLogin(OAuthLogin):
 
 class OpenIDController(OAuthController):
     """Correlate opaque OIDC callback state before native terminal sign-in."""
+
+    @http.route("/auth_oidc/start", type="http", auth="none", readonly=False)
+    def start(self, intent=None, **_kw):
+        """Create one bounded attempt after a staged provider link is followed."""
+        ensure_db()
+        start_data = self._pop_start_state(intent)
+        if not isinstance(start_data, dict):
+            return self._generic_failure()
+        native_state = start_data.get("native_state")
+        if not isinstance(native_state, dict):
+            return self._generic_failure()
+        provider_id = native_state.get("p")
+        callback_uri = start_data.get("callback_uri")
+        website_id = start_data.get("website_id") or False
+        if (
+            type(provider_id) is not int
+            or provider_id <= 0
+            or native_state.get("d") != request.session.db
+            or not isinstance(callback_uri, str)
+            or not callback_uri
+            or (website_id is not False and type(website_id) is not int)
+        ):
+            return self._generic_failure()
+
+        provider_record = (
+            request.env["auth.oauth.provider"]
+            .sudo()
+            .search(
+                [
+                    ("id", "=", provider_id),
+                    ("enabled", "=", True),
+                    ("flow", "=", "id_token_code"),
+                ],
+                limit=1,
+            )
+        )
+        if not provider_record:
+            return self._generic_failure()
+
+        try:
+            attempt, state = request.env[
+                "auth.oidc.login.attempt"
+            ]._create_for_authorization(
+                provider_record,
+                request.session.db,
+                request.session.sid,
+                native_state,
+                website_id,
+                callback_uri,
+            )
+        except AccessDenied:
+            return self._generic_failure()
+
+        params = {
+            "response_type": "code",
+            "client_id": provider_record.client_id,
+            "redirect_uri": callback_uri,
+            "state": state,
+            "nonce": attempt.nonce,
+            "code_challenge": attempt.code_challenge(),
+            "code_challenge_method": "S256",
+        }
+        if provider_record.scope:
+            params["scope"] = provider_record.scope
+        response = request.redirect(
+            f"{provider_record.auth_endpoint}?{url_encode(params)}", 303
+        )
+        response.autocorrect_location_header = False
+        return response
+
+    @staticmethod
+    def _pop_start_state(intent):
+        """Consume one opaque session-staged native OAuth state."""
+        if not isinstance(intent, str):
+            return None
+        start_states = dict(request.session.get(START_STATE_SESSION_KEY) or {})
+        start_data = start_states.pop(intent, None)
+        if start_states:
+            request.session[START_STATE_SESSION_KEY] = start_states
+        else:
+            request.session.pop(START_STATE_SESSION_KEY, None)
+        return start_data
 
     @http.route()
     @fragment_to_query_string
