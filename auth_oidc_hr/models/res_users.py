@@ -17,11 +17,29 @@ class ResUsers(models.Model):
     def _auth_oidc_finalize_user_provisioning(
         self, provider, principal, login_context, user
     ):
-        """Reconcile exactly one employee in the user's Default Company."""
+        """Reconcile the verified JWT department when this source owns it."""
         super()._auth_oidc_finalize_user_provisioning(
             provider, principal, login_context, user
         )
-        claim_value = principal.claims.get("department")
+        if self._auth_oidc_hr_should_reconcile_jwt_department(
+            provider, principal, login_context, user
+        ):
+            self._auth_oidc_hr_reconcile_department(
+                provider, user, principal.claims.get("department")
+            )
+
+    @api.model
+    def _auth_oidc_hr_should_reconcile_jwt_department(
+        self, provider, principal, login_context, user
+    ):
+        """Return whether verified-JWT department reconciliation applies."""
+        del provider, principal, login_context, user
+        return True
+
+    @api.model
+    def _auth_oidc_hr_reconcile_department(self, provider, user, source_value):
+        """Map one validated department source and reconcile one employee."""
+        claim_value = source_value
         if not isinstance(claim_value, str):
             raise OIDCAuthenticationError("invalid_department_claim")
         claim_value = claim_value.strip()

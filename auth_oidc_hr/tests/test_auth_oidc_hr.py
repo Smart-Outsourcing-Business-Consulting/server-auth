@@ -2,6 +2,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 from types import MappingProxyType
+from unittest.mock import patch
 
 import responses
 from psycopg2 import IntegrityError
@@ -172,6 +173,33 @@ class TestAuthOIDCHR(TransactionCase):
                 ),
                 1,
             )
+
+    def test_neutral_reconciliation_maps_and_updates_one_employee(self):
+        user = self._create_user(
+            "Neutral seam user", "neutral-seam-user", "base.group_portal"
+        )
+        users = self.env["res.users"]
+        users._auth_oidc_hr_reconcile_department(self.provider, user, " Operations ")
+        employee = self.env["hr.employee"].search(
+            [("user_id", "=", user.id), ("company_id", "=", self.company.id)]
+        )
+        self.assertEqual(len(employee), 1)
+        self.assertEqual(employee.department_id, self.department)
+
+        finance_department = self.env["hr.department"].create(
+            {"name": "Finance", "company_id": self.company.id}
+        )
+        self.env["auth.oidc.hr.department.mapping"].create(
+            {
+                "provider_id": self.provider.id,
+                "claim_value": "Finance",
+                "company_id": self.company.id,
+                "department_id": finance_department.id,
+            }
+        )
+        users._auth_oidc_hr_reconcile_department(self.provider, user, "Finance")
+        self.assertEqual(len(employee), 1)
+        self.assertEqual(employee.department_id, finance_department)
 
     def test_internal_and_portal_archived_employee_deny_without_replacement(self):
         for group_xmlid, login in (
@@ -359,6 +387,46 @@ class TestAuthOIDCHRAdapter(TransactionCase):
             ]
         )
         self.assertEqual(employee.department_id, self.department)
+        self.assertEqual(claimed.status, "consumed")
+
+    @responses.activate
+    def test_adapter_source_hook_skips_jwt_department_reconciliation(self):
+        self.env["auth.oidc.hr.department.mapping"].search(
+            [("provider_id", "=", self.provider.id)]
+        ).unlink()
+        attempt, state = self.env["auth.oidc.login.attempt"]._create_for_authorization(
+            self.provider,
+            self.env.cr.dbname,
+            "auth-oidc-hr-scim-session",
+            {"d": self.env.cr.dbname, "p": self.provider.id, "r": "/odoo"},
+            False,
+            "http://localhost:8069/auth_oauth/signin",
+        )
+        TestAuthOIDCAuthorizationCodeFlow._prepare_login_test_responses(
+            self,
+            attempt,
+            claims={"department": "Unmapped"},
+        )
+        claimed = self.env["auth.oidc.login.attempt"].claim_from_callback(
+            state, self.env.cr.dbname, "auth-oidc-hr-scim-session"
+        )
+        with patch.object(
+            type(self.env["res.users"]),
+            "_auth_oidc_hr_should_reconcile_jwt_department",
+            return_value=False,
+        ):
+            self.env["res.users"].auth_oauth(
+                self.provider.id,
+                {"_auth_oidc_attempt_id": claimed.id, "code": "code-sentinel"},
+            )
+        self.assertFalse(
+            self.env["hr.employee"].search(
+                [
+                    ("user_id", "=", self.user.id),
+                    ("company_id", "=", self.user.company_id.id),
+                ]
+            )
+        )
         self.assertEqual(claimed.status, "consumed")
 
     @responses.activate
