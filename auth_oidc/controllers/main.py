@@ -141,7 +141,9 @@ class OpenIDController(OAuthController):
         if provider_record.scope:
             params["scope"] = provider_record.scope
         response = request.redirect(
-            f"{provider_record.auth_endpoint}?{url_encode(params)}", 303
+            f"{provider_record.auth_endpoint}?{url_encode(params)}",
+            303,
+            local=False,
         )
         response.autocorrect_location_header = False
         return response
