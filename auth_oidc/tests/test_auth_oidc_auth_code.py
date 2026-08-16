@@ -6,11 +6,12 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import time
 from dataclasses import FrozenInstanceError
 from datetime import timedelta
 from unittest.mock import patch
-from urllib.parse import parse_qs, unquote_plus, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlencode, urlparse, urlunparse
 
 import responses
 from cryptography.hazmat.primitives import serialization
@@ -37,6 +38,27 @@ from ..models.res_users import OIDCFailure, ResUsers, VerifiedOIDCLoginContext
 BASE_URL = f"http://localhost:{odoo.tools.config['http_port']}"
 
 
+def _redirect_honoring_local(env):
+    """Return one ``request.redirect`` stand-in that honors ``local``.
+
+    The website ``MockRequest`` fixture wires ``redirect`` straight to
+    ``IrHttp._redirect``, which has no ``local`` parameter at all, so it
+    silently drops the scheme/host-stripping ``odoo.http.Request.redirect``
+    normally applies. Reproduce that stripping here so a mocked request
+    exercises the same host-handling a real routed request would.
+    """
+
+    def _redirect(location, code=303, local=True):
+        if local:
+            parsed = urlparse(location)
+            location = urlunparse(("", "", parsed.path, parsed.params, parsed.query, parsed.fragment))
+            if not location.startswith("/"):
+                location = "/" + location
+        return env["ir.http"]._redirect(location, code)
+
+    return _redirect
+
+
 @contextlib.contextmanager
 def MockRequest(env):
     with _MockRequest(env) as request:
@@ -44,6 +66,7 @@ def MockRequest(env):
         request.params = {}
         request.session.db = env.cr.dbname
         request.session.sid = "auth-oidc-test-session"
+        request.redirect = _redirect_honoring_local(env)
         yield request
 
 
@@ -1076,3 +1099,116 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         )
         exchange_attempt.invalidate_recordset(["status"])
         self.assertEqual(exchange_attempt.status, "failed")
+
+    def _drive_real_http_login_start(self):
+        """Load /web/login for real and follow its OIDC link for real.
+
+        Returns the pending attempt created by the real ``/auth_oidc/start``
+        request, plus the anonymous session id observed before it.
+        """
+        login_page = self.url_open("/web/login")
+        login_page.raise_for_status()
+        anonymous_sid = self.opener.cookies.get("session_id")
+        self.assertTrue(anonymous_sid, "HttpCase opener must carry a session id")
+        match = re.search(r'href="(/auth_oidc/start\?intent=[^"]+)"', login_page.text)
+        self.assertTrue(match, "no /auth_oidc/start link rendered on /web/login")
+        start_url = match.group(1).replace("&amp;", "&")
+
+        start_response = self.url_open(start_url, allow_redirects=False)
+        self.assertEqual(start_response.status_code, 303)
+        self.assertTrue(
+            start_response.headers["Location"].startswith(
+                self.provider_rec.auth_endpoint
+            )
+        )
+        state = parse_qs(urlparse(start_response.headers["Location"]).query)[
+            "state"
+        ][0]
+        attempt = self.env["auth.oidc.login.attempt"].search(
+            [("state_digest", "=", hashlib.sha256(state.encode()).hexdigest())]
+        )
+        self.assertTrue(attempt, "no attempt row created by the real start route")
+        return attempt, state, anonymous_sid
+
+    @responses.activate
+    def _assert_real_http_success_rotates_session(self, user, subject):
+        """Drive one full routed OIDC success and assert real rotation.
+
+        Only the token and JWKS endpoints are mocked; ``/web/login``,
+        ``/auth_oidc/start``, and ``/auth_oauth/signin`` are hit for real
+        through the HttpCase opener, so this proves what a direct
+        controller call cannot: that a genuinely different session id is
+        stored and cookied after native ``Session.authenticate()`` and
+        ``finalize()`` run inside real post-dispatch.
+        """
+        responses.add_passthru(self.base_url())
+        self.env["auth.oauth.provider"].search(
+            [("client_id", "!=", "auth_oidc-test")]
+        ).write({"enabled": False})
+
+        attempt, state, anonymous_sid = self._drive_real_http_login_start()
+        self._prepare_login_test_responses(attempt, claims={"sub": subject})
+
+        signin_response = self.url_open(
+            "/auth_oauth/signin?{}".format(
+                urlencode({"state": state, "code": "code-sentinel"})
+            ),
+            allow_redirects=False,
+        )
+
+        self.assertEqual(signin_response.status_code, 303)
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "consumed")
+
+        new_sid = self.opener.cookies.get("session_id")
+        self.assertTrue(new_sid)
+        self.assertNotEqual(
+            new_sid,
+            anonymous_sid,
+            "session id did not rotate across the real routed OIDC callback",
+        )
+        stored_session = odoo.http.root.session_store.get(new_sid)
+        self.assertEqual(stored_session.uid, user.id)
+
+        check_response = self.url_open(
+            "/web/session/check",
+            headers={"Content-Type": "application/json"},
+            data="{}",
+        )
+        check_response.raise_for_status()
+        return signin_response
+
+    def test_internal_user_real_http_success_path_rotates_session(self):
+        """Test a real routed OIDC success for an internal user rotates the SID."""
+        user = self._prepare_login_test_user()
+        self.assertTrue(user._is_internal())
+        response = self._assert_real_http_success_rotates_session(
+            user, subject="test-subject"
+        )
+        self.assertEqual(
+            self.parse_http_location(response.headers["Location"]).path, "/web"
+        )
+
+    def test_portal_user_real_http_success_path_rotates_session(self):
+        """Test a real routed OIDC success for a portal user rotates the SID."""
+        portal_user = (
+            self.env["res.users"]
+            .with_context(no_reset_password=True)
+            .create(
+                {
+                    "name": "OIDC portal user",
+                    "login": "oidc-portal-user@example.test",
+                    "email": "oidc-portal-user@example.test",
+                    "groups_id": [(6, 0, [self.env.ref("base.group_portal").id])],
+                    "oauth_provider_id": self.provider_rec.id,
+                    "oauth_uid": "portal-test-subject",
+                }
+            )
+        )
+        self.assertFalse(portal_user._is_internal())
+        response = self._assert_real_http_success_rotates_session(
+            portal_user, subject="portal-test-subject"
+        )
+        self.assertEqual(
+            self.parse_http_location(response.headers["Location"]).path, "/"
+        )
