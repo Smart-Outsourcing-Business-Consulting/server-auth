@@ -111,26 +111,36 @@ class ResUsers(models.Model):
                 "state": json.dumps(attempt.native_state),
             }
             login_context = VerifiedOIDCLoginContext.from_attempt(attempt)
-            with self.env.cr.savepoint():
-                login = self._auth_oidc_signin(
-                    oauth_provider.id, principal, login_context, native_params
+            try:
+                with self.env.cr.savepoint():
+                    login = self._auth_oidc_signin(
+                        oauth_provider.id, principal, login_context, native_params
+                    )
+                    if not login:
+                        raise OIDCAuthenticationError("native_signin_denied")
+                    final_user = self.with_context(active_test=False).search(
+                        [
+                            ("oauth_provider_id", "=", oauth_provider.id),
+                            ("oauth_uid", "=", principal.subject),
+                        ]
+                    )
+                    if (
+                        len(final_user) != 1
+                        or not final_user.active
+                        or final_user.login != login
+                    ):
+                        raise OIDCAuthenticationError("final_user_mismatch")
+                    self._auth_oidc_finalize_user_provisioning(
+                        oauth_provider, principal, login_context, final_user
+                    )
+            except Exception:
+                self._notify_oidc_authorization_result(
+                    oauth_provider.id, login_context, status="rolled_back"
                 )
-                if not login:
-                    raise OIDCAuthenticationError("native_signin_denied")
-                final_user = self.with_context(active_test=False).search(
-                    [
-                        ("oauth_provider_id", "=", oauth_provider.id),
-                        ("oauth_uid", "=", principal.subject),
-                    ]
-                )
-                if (
-                    len(final_user) != 1
-                    or not final_user.active
-                    or final_user.login != login
-                ):
-                    raise OIDCAuthenticationError("final_user_mismatch")
-                self._auth_oidc_finalize_user_provisioning(
-                    oauth_provider, principal, login_context, final_user
+                raise
+            else:
+                self._notify_oidc_authorization_result(
+                    oauth_provider.id, login_context, status="applied", user=final_user
                 )
             attempt.mark_consumed()
             return self.env.cr.dbname, login, access_token
@@ -185,6 +195,32 @@ class ResUsers(models.Model):
     ):
         """Finalize one verified OIDC user's provisioning before authentication."""
         del provider, principal, login_context, user
+
+    @api.model
+    def _notify_oidc_authorization_result(
+        self, provider, login_context, *, status, user=None
+    ):
+        try:
+            with self.env.cr.savepoint():
+                self._auth_oidc_authorization_result(
+                    provider, login_context, status=status, user=user
+                )
+        except Exception:  # noqa: BLE001 - Observer failures must not deny authentication.
+            _logger.debug(
+                "OIDC authorization result hook failed provider_id=%s attempt_id=%s",
+                provider,
+                login_context.attempt_id,
+            )
+
+    @api.model
+    def _auth_oidc_authorization_result(
+        self, provider, login_context, *, status, user=None
+    ):
+        """Observe authorization savepoint release or rollback, never HTTP commit.
+
+        Rollback notifications carry no potentially reverted user record.
+        """
+        del provider, login_context, status, user
 
     @api.model
     def _notify_oidc_failure(self, provider, error, attempt):
