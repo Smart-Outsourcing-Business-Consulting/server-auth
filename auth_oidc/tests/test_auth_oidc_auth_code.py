@@ -727,6 +727,36 @@ class TestAuthOIDCAuthorizationCodeFlow(common.HttpCase):
         self.assertEqual(response.location, "/web/login")
 
     @responses.activate
+    def test_unexpected_failure_log_excludes_exception_text(self):
+        self._prepare_login_test_user()
+        attempt = self._claimed_attempt()
+        self._prepare_login_test_responses(attempt)
+
+        with (
+            patch.object(
+                ResUsers,
+                "_auth_oidc_finalize_user_provisioning",
+                autospec=True,
+                side_effect=RuntimeError("unexpected-finalizer-secret-sentinel"),
+            ),
+            self.assertLogs(
+                "odoo.addons.auth_oidc.models.res_users", level=logging.ERROR
+            ) as logs,
+        ):
+            self._auth_oauth_denied(
+                self.provider_rec.id,
+                {"_auth_oidc_attempt_id": attempt.id, "code": "code-sentinel"},
+            )
+
+        attempt.invalidate_recordset(["status"])
+        self.assertEqual(attempt.status, "failed")
+        output = "\n".join(logs.output)
+        self.assertIn(f"provider_id={self.provider_rec.id}", output)
+        self.assertIn(f"attempt_id={attempt.id}", output)
+        self.assertNotIn("unexpected-finalizer-secret-sentinel", output)
+        self.assertNotIn("Traceback", output)
+
+    @responses.activate
     def test_finalizer_requires_matching_exact_identity_login(self):
         """Test a callback cannot finalize a different user login."""
         self._prepare_login_test_user()
