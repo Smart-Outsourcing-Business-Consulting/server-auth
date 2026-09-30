@@ -154,9 +154,9 @@ class ResUsers(models.Model):
                 attempt.id,
             )
             raise AccessDenied() from None
-        except Exception:
+        except Exception:  # noqa: BLE001 - Authentication boundary fails closed.
             attempt.mark_failed()
-            _logger.exception(
+            _logger.error(
                 "Unexpected OIDC authentication failure provider_id=%s attempt_id=%s",
                 oauth_provider.id,
                 attempt.id,
